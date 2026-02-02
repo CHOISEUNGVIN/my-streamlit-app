@@ -1,15 +1,37 @@
-import streamlit as st
+import json
 import requests
+import streamlit as st
+from typing import Dict, List, Tuple, Optional
 
-# =========================
-# 페이지 설정
-# =========================
-st.set_page_config(page_title="나와 어울리는 영화는?", layout="centered")
+# OpenAI Python SDK (v2+)
+from openai import OpenAI
 
-# =========================
-# TMDB 설정
-# =========================
-GENRES = {
+# -----------------------------
+# Page config
+# -----------------------------
+st.set_page_config(page_title="🎬 나와 어울리는 영화는?", page_icon="🎬", layout="wide")
+
+st.title("🎬 나와 어울리는 영화는?")
+st.write("질문에 답하면, 당신의 성향을 분석해 **어울리는 영화 장르**와 **지금 인기 있는 영화 5편**을 추천해드려요! 🎥🍿")
+st.caption("※ OpenAI는 '분석/추천 이유 생성'에 사용되고, 영화 데이터는 TMDB에서 가져옵니다.")
+st.divider()
+
+# -----------------------------
+# Sidebar: API keys
+# -----------------------------
+st.sidebar.header("🔑 API 설정")
+openai_key = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="OpenAI API Key")
+tmdb_key = st.sidebar.text_input("TMDB API Key", type="password", placeholder="TMDB API Key")
+model_name = st.sidebar.text_input("OpenAI 모델(선택)", value="gpt-5.2-mini")
+st.sidebar.caption("모델명은 계정/권한에 따라 다를 수 있어요.")
+
+# -----------------------------
+# TMDB config
+# -----------------------------
+POSTER_BASE = "https://image.tmdb.org/t/p/w500"
+
+# 요구사항 장르 ID
+TMDB_GENRES = {
     "액션": 28,
     "코미디": 35,
     "드라마": 18,
@@ -17,182 +39,68 @@ GENRES = {
     "로맨스": 10749,
     "판타지": 14,
 }
-POSTER_BASE = "https://image.tmdb.org/t/p/w500"
 
-def fetch_movies(api_key: str, genre_id: int, n: int = 5):
-    url = "https://api.themoviedb.org/3/discover/movie"
-    params = {
-        "api_key": api_key,
-        "with_genres": genre_id,
-        "language": "ko-KR",
-        "sort_by": "popularity.desc",
-        "page": 1,
-    }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json().get("results", [])[:n]
+# 4지선다(성향 그룹) -> 장르 후보(더 정교한 혼합을 위해 2개 후보를 둠)
+PREFERENCE_TO_GENRES = {
+    "로맨스/드라마": ["로맨스", "드라마"],
+    "액션/어드벤처": ["액션"],  # 요구사항 내 ID 기준으로 액션만 사용
+    "SF/판타지": ["SF", "판타지"],
+    "코미디": ["코미디"],
+}
 
-# =========================
-# 답변 → 장르 분석
-# =========================
-def analyze_genre(ans):
-    score = {k: 0 for k in GENRES.keys()}
-
-    # Q1 여가
-    if ans["q1"] in ["집에서 아무것도 안 하기", "혼자 조용히 쉬기"]:
-        score["드라마"] += 2; score["로맨스"] += 1
-    elif ans["q1"] in ["친구들과 수다", "보드게임/파티"]:
-        score["코미디"] += 2
-    elif ans["q1"] in ["즉흥 여행", "새로운 동네 탐방"]:
-        score["액션"] += 1; score["판타지"] += 1
-    elif ans["q1"] in ["혼자 취미 몰입", "전시/책/영화"]:
-        score["SF"] += 2; score["드라마"] += 1
-
-    # Q2 스트레스
-    if ans["q2"] in ["운동으로 풀기", "몸을 많이 움직이기"]:
-        score["액션"] += 2
-    elif ans["q2"] in ["웃긴 영상 보기", "친구랑 수다"]:
-        score["코미디"] += 2
-    elif ans["q2"] in ["감정 정리", "혼자 생각"]:
-        score["드라마"] += 2
-    elif ans["q2"] in ["맛있는 거 먹기", "카페/산책"]:
-        score["로맨스"] += 1; score["드라마"] += 1
-
-    # Q3 영화 취향
-    if ans["q3"] == "눈과 귀가 즐거운 영화":
-        score["SF"] += 2; score["판타지"] += 2
-    elif ans["q3"] == "현실적인 이야기":
-        score["드라마"] += 3
-    elif ans["q3"] == "아무 생각 없이 웃기는 영화":
-        score["코미디"] += 3
-    elif ans["q3"] == "긴장감 넘치는 전개":
-        score["액션"] += 3
-    elif ans["q3"] == "설레는 감정":
-        score["로맨스"] += 3
-
-    # Q4 여행 스타일
-    if ans["q4"] == "계획 빡빡":
-        score["SF"] += 1; score["드라마"] += 1
-    elif ans["q4"] == "즉흥/자유":
-        score["코미디"] += 1; score["액션"] += 1
-    elif ans["q4"] == "액티비티 위주":
-        score["액션"] += 2
-    elif ans["q4"] == "힐링/감성":
-        score["로맨스"] += 2; score["드라마"] += 1
-
-    # Q5 성향
-    if ans["q5"] == "분위기 메이커":
-        score["코미디"] += 2
-    elif ans["q5"] == "리더형":
-        score["액션"] += 1; score["판타지"] += 1
-    elif ans["q5"] == "공감형":
-        score["드라마"] += 2; score["로맨스"] += 1
-    elif ans["q5"] == "독립형":
-        score["SF"] += 2
-
-    return max(score.items(), key=lambda x: x[1])[0]
-
-# =========================
-# 사이드바
-# =========================
-with st.sidebar:
-    st.header("🔑 TMDB API 설정")
-    tmdb_key = st.text_input("TMDB API Key", type="password")
-
-# =========================
-# UI
-# =========================
-st.title("🎬 나와 어울리는 영화는?")
-st.write("조금 더 세분화된 질문으로, 당신의 영화 취향을 알아볼게요 🎥🍿")
-st.divider()
-
-q1 = st.radio(
-    "1️⃣ 주말에 가장 끌리는 활동은?",
-    [
-        "집에서 아무것도 안 하기",
-        "혼자 조용히 쉬기",
-        "친구들과 수다",
-        "보드게임/파티",
-        "즉흥 여행",
-        "새로운 동네 탐방",
-        "혼자 취미 몰입",
-        "전시/책/영화"
-    ]
-)
-
-q2 = st.radio(
-    "2️⃣ 스트레스를 풀 때 가장 가까운 방법은?",
-    [
-        "혼자 생각 정리",
-        "감정 정리/일기",
-        "친구랑 수다",
-        "웃긴 영상 보기",
-        "운동으로 풀기",
-        "몸을 많이 움직이기",
-        "맛있는 거 먹기",
-        "카페나 산책"
-    ]
-)
-
-q3 = st.radio(
-    "3️⃣ 영화를 고를 때 가장 중요한 포인트는?",
-    [
-        "현실적인 이야기",
-        "감정 몰입",
-        "설레는 감정",
-        "아무 생각 없이 웃김",
-        "긴장감 넘치는 전개",
-        "눈과 귀가 즐거운 영화"
-    ]
-)
-
-q4 = st.radio(
-    "4️⃣ 여행을 간다면 나는?",
-    [
-        "계획 빡빡하게",
-        "일정은 대충",
-        "즉흥/자유",
-        "액티비티 위주",
-        "힐링/감성 여행"
-    ]
-)
-
-q5 = st.radio(
-    "5️⃣ 친구들 사이에서 나는?",
-    [
-        "분위기 메이커",
-        "리더형",
-        "공감형",
-        "독립형",
-        "필요할 때 나타나는 타입"
-    ]
-)
-
-st.divider()
-
-if st.button("🎞️ 결과 보기"):
-    if not tmdb_key:
-        st.error("TMDB API Key를 입력해 주세요!")
-        st.stop()
-
-    answers = {"q1": q1, "q2": q2, "q3": q3, "q4": q4, "q5": q5}
-    genre = analyze_genre(answers)
-    genre_id = GENRES[genre]
-
-    st.subheader(f"✨ 당신과 어울리는 장르는 **{genre}**")
-    st.write("이제 당신의 취향과 맞는 인기 영화를 보여드릴게요 🍿")
-
-    movies = fetch_movies(tmdb_key, genre_id)
-
-    for m in movies:
-        cols = st.columns([1, 2])
-        with cols[0]:
-            if m.get("poster_path"):
-                st.image(POSTER_BASE + m["poster_path"], use_container_width=True)
-        with cols[1]:
-            st.markdown(f"### {m.get('title')}")
-            st.write(f"⭐ 평점: {m.get('vote_average')}")
-            st.write(m.get("overview", "줄거리 정보가 없어요."))
-            st.caption("💡 추천 이유: 당신의 답변이 이 장르와 잘 맞아요.")
-
-        st.divider()
+# -----------------------------
+# Questions (10)
+# option format: "<TAG> | <TEXT>"
+# TAG: 로맨스/드라마, 액션/어드벤처, SF/판타지, 코미디
+# -----------------------------
+questions = [
+    {
+        "q": "Q1. 시험이 끝난 금요일 밤, 너의 선택은?",
+        "options": [
+            "로맨스/드라마 | 조용한 방에서 여운 남는 영화 한 편 보며 생각에 잠긴다",
+            "액션/어드벤처 | 친구들이랑 극장 가서 박진감 넘치는 영화로 스트레스 날린다",
+            "SF/판타지 | 세계관 탄탄한 영화 보면서 “이 설정 뭐야” 하며 몰입한다",
+            "코미디 | 아무 생각 안 하고 웃긴 영화 틀어놓고 깔깔 웃는다",
+        ],
+    },
+    {
+        "q": "Q2. 영화 속 주인공으로 살 하루가 주어진다면?",
+        "options": [
+            "로맨스/드라마 | 사랑과 인생의 갈림길에서 고민하는 주인공",
+            "액션/어드벤처 | 위기의 순간마다 몸으로 돌파하는 히어로",
+            "SF/판타지 | 다른 차원이나 미래 세계를 여행하는 존재",
+            "코미디 | 사고를 치지만 미워할 수 없는 문제적 인물",
+        ],
+    },
+    {
+        "q": "Q3. 영화를 보고 난 뒤, 네가 가장 중요하게 느끼는 건?",
+        "options": [
+            "로맨스/드라마 | 감정선과 메시지, 그리고 여운",
+            "액션/어드벤처 | 액션 장면의 쾌감과 긴장감",
+            "SF/판타지 | 설정의 신선함과 “와 이런 생각을?” 하는 놀라움",
+            "코미디 | 얼마나 웃었는지, 기분이 가벼워졌는지",
+        ],
+    },
+    {
+        "q": "Q4. 비 오는 날, 약속이 취소됐다. 어떤 영화가 땡겨?",
+        "options": [
+            "로맨스/드라마 | 혼자 보기 좋은 감성적인 영화",
+            "액션/어드벤처 | 집에서라도 스케일 큰 영화로 기분 전환",
+            "SF/판타지 | 현실을 잠시 잊게 해주는 다른 세계 이야기",
+            "코미디 | 우울함을 날려줄 웃긴 영화",
+        ],
+    },
+    {
+        "q": "Q5. 친구가 “이 영화 꼭 봐야 해”라고 추천했다. 이유는?",
+        "options": [
+            "로맨스/드라마 | “인생에 대해 생각하게 돼”",
+            "액션/어드벤처 | “액션 미쳤어, 시간 순삭”",
+            "SF/판타지 | “세계관이랑 설정이 진짜 신박해”",
+            "코미디 | “진짜 웃다가 눈물 난다”",
+        ],
+    },
+    # 추가 질문 5개
+    {
+        "q": "Q6. 영화 예고편을 볼 때 제일 먼저 꽂히는 건?",
+        "options": [
+            "로맨스/드라마 | 표정/대사/감정선이 확 끌
