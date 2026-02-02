@@ -3,18 +3,97 @@ import requests
 import streamlit as st
 from typing import Dict, List, Tuple, Optional
 
-# OpenAI Python SDK (v2+)
 from openai import OpenAI
 
 # -----------------------------
 # Page config
 # -----------------------------
-st.set_page_config(page_title="🎬 나와 어울리는 영화는?", page_icon="🎬", layout="wide")
+st.set_page_config(
+    page_title="🎬 나와 어울리는 영화는?",
+    page_icon="🎬",
+    layout="wide",
+)
 
-st.title("🎬 나와 어울리는 영화는?")
-st.write("질문에 답하면, 당신의 성향을 분석해 **어울리는 영화 장르**와 **지금 인기 있는 영화 5편**을 추천해드려요! 🎥🍿")
-st.caption("※ OpenAI는 '분석/추천 이유 생성'에 사용되고, 영화 데이터는 TMDB에서 가져옵니다.")
-st.divider()
+# -----------------------------
+# Cinema-like UI (readable, not too dark)
+# -----------------------------
+st.markdown(
+    """
+<style>
+/* App background + typography */
+.stApp {
+  background: radial-gradient(1200px 600px at 30% 0%, #fff7e6 0%, #fffaf1 35%, #fffdf7 70%, #ffffff 100%);
+  color: #1f2937;
+}
+
+/* Make the top header area breathe */
+.block-container { padding-top: 2.0rem; padding-bottom: 3rem; max-width: 1100px; }
+
+/* “Cinema” accent */
+:root {
+  --cinema-red: #c81d25;
+  --cinema-gold: #f2c94c;
+  --card: rgba(255,255,255,0.86);
+  --border: rgba(17,24,39,0.10);
+}
+
+/* Title badge */
+.cinema-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .5rem .75rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255,255,255,0.75);
+  box-shadow: 0 10px 30px rgba(17,24,39,0.06);
+  font-weight: 700;
+}
+
+/* Section card */
+.section-card {
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 18px;
+  padding: 1rem 1.1rem;
+  box-shadow: 0 14px 40px rgba(17,24,39,0.08);
+}
+
+/* Movie card */
+.movie-card {
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.90);
+  border-radius: 22px;
+  padding: 1rem;
+  box-shadow: 0 16px 50px rgba(17,24,39,0.10);
+}
+
+/* Small label chips */
+.chip {
+  display:inline-flex;
+  align-items:center;
+  gap:.4rem;
+  padding:.22rem .55rem;
+  border-radius:999px;
+  border: 1px solid rgba(200,29,37,0.18);
+  background: rgba(200,29,37,0.06);
+  color: #7f1d1d;
+  font-size: .85rem;
+  font-weight: 600;
+}
+
+/* Subtle divider */
+hr { border: none; border-top: 1px solid rgba(17,24,39,0.08); margin: 1.2rem 0; }
+
+/* Primary button tone (Streamlit theme-safe) */
+.stButton > button[kind="primary"] {
+  border-radius: 14px;
+  font-weight: 700;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 # -----------------------------
 # Sidebar: API keys
@@ -23,14 +102,22 @@ st.sidebar.header("🔑 API 설정")
 openai_key = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="OpenAI API Key")
 tmdb_key = st.sidebar.text_input("TMDB API Key", type="password", placeholder="TMDB API Key")
 model_name = st.sidebar.text_input("OpenAI 모델(선택)", value="gpt-5.2-mini")
-st.sidebar.caption("모델명은 계정/권한에 따라 다를 수 있어요.")
+st.sidebar.caption("OpenAI 키가 없으면 기본 로직으로만 추천합니다.")
+
+# -----------------------------
+# Header
+# -----------------------------
+st.markdown('<div class="cinema-badge">🍿 <span>Campus Cinema Test</span> <span class="chip">가독성 좋은 영화관 무드</span></div>', unsafe_allow_html=True)
+st.title("🎬 나와 어울리는 영화는?")
+st.write("질문에 답하면 당신의 취향을 분석해 **딱 3편만** 골라 추천해드려요. (많이 말고, 제대로!)")
+st.caption("추천 결과에는 **한 줄 소개**와 **추천 이유**가 함께 나옵니다.")
+st.markdown("<hr/>", unsafe_allow_html=True)
 
 # -----------------------------
 # TMDB config
 # -----------------------------
 POSTER_BASE = "https://image.tmdb.org/t/p/w500"
 
-# 요구사항 장르 ID
 TMDB_GENRES = {
     "액션": 28,
     "코미디": 35,
@@ -40,18 +127,17 @@ TMDB_GENRES = {
     "판타지": 14,
 }
 
-# 4지선다(성향 그룹) -> 장르 후보(더 정교한 혼합을 위해 2개 후보를 둠)
+# group -> candidates
 PREFERENCE_TO_GENRES = {
     "로맨스/드라마": ["로맨스", "드라마"],
-    "액션/어드벤처": ["액션"],  # 요구사항 내 ID 기준으로 액션만 사용
+    "액션/어드벤처": ["액션"],
     "SF/판타지": ["SF", "판타지"],
     "코미디": ["코미디"],
 }
 
 # -----------------------------
-# Questions (10)
-# option format: "<TAG> | <TEXT>"
-# TAG: 로맨스/드라마, 액션/어드벤처, SF/판타지, 코미디
+# Questions (10) - same structure
+# option: "<TAG> | <TEXT>"
 # -----------------------------
 questions = [
     {
@@ -99,7 +185,6 @@ questions = [
             "코미디 | “진짜 웃다가 눈물 난다”",
         ],
     },
-    # 추가 질문 5개
     {
         "q": "Q6. 영화 예고편을 볼 때 제일 먼저 꽂히는 건?",
         "options": [
@@ -153,6 +238,9 @@ questions = [
 def parse_tag(choice_text: str) -> str:
     return choice_text.split("|", 1)[0].strip()
 
+def parse_text(choice_text: str) -> str:
+    return choice_text.split("|", 1)[1].strip()
+
 def compute_preference_counts(answers: List[str]) -> Dict[str, int]:
     counts = {"로맨스/드라마": 0, "액션/어드벤처": 0, "SF/판타지": 0, "코미디": 0}
     for a in answers:
@@ -162,25 +250,22 @@ def compute_preference_counts(answers: List[str]) -> Dict[str, int]:
     return counts
 
 def fallback_pick_genres(counts: Dict[str, int]) -> Tuple[str, Optional[str]]:
-    """OpenAI 없이도 동작하는 기본 로직: 최다 그룹 -> 대표 장르, 2등 그룹 -> 대표 장르"""
-    # 그룹 우선순위(동점일 때)
     group_priority = ["SF/판타지", "액션/어드벤처", "로맨스/드라마", "코미디"]
     sorted_groups = sorted(counts.items(), key=lambda kv: (-kv[1], group_priority.index(kv[0])))
     primary_group = sorted_groups[0][0]
     secondary_group = sorted_groups[1][0] if len(sorted_groups) > 1 else None
 
-    def group_to_genre(group: str) -> str:
-        # 대표 장르 선택
+    def rep(group: str) -> str:
         if group == "로맨스/드라마":
-            return "드라마"  # 기본은 드라마
+            return "드라마"
         if group == "액션/어드벤처":
             return "액션"
         if group == "SF/판타지":
             return "SF"
         return "코미디"
 
-    primary = group_to_genre(primary_group)
-    secondary = group_to_genre(secondary_group) if secondary_group else None
+    primary = rep(primary_group)
+    secondary = rep(secondary_group) if secondary_group else None
     if secondary == primary:
         secondary = None
     return primary, secondary
@@ -200,8 +285,8 @@ def tmdb_discover(api_key: str, genre_id: int, page: int = 1) -> dict:
     return r.json()
 
 def fetch_top_movies(api_key: str, genre_name: str, n: int) -> List[dict]:
-    genre_id = TMDB_GENRES[genre_name]
-    data = tmdb_discover(api_key, genre_id, page=1)
+    gid = TMDB_GENRES[genre_name]
+    data = tmdb_discover(api_key, gid, page=1)
     return (data.get("results") or [])[:n]
 
 def build_poster_url(poster_path: Optional[str]) -> Optional[str]:
@@ -209,43 +294,39 @@ def build_poster_url(poster_path: Optional[str]) -> Optional[str]:
         return None
     return f"{POSTER_BASE}{poster_path}"
 
+def clamp_text(s: str, max_len: int = 140) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
+
 def openai_analyze(
     api_key: str,
     model: str,
     qa_pairs: List[Tuple[str, str]],
     counts: Dict[str, int],
 ) -> dict:
-    """
-    Returns JSON with:
-      primary_genre: one of [액션, 코미디, 드라마, SF, 로맨스, 판타지]
-      secondary_genre: same or null
-      reason: short korean
-      keywords: [..] 3~7
-    """
     client = OpenAI(api_key=api_key)
 
-    # compact하게 QA를 텍스트로 구성
-    qa_text = "\n".join([f"- {q} -> {a.split('|',1)[1].strip()}" for q, a in qa_pairs])
+    qa_text = "\n".join([f"- {q} -> {parse_text(a)}" for q, a in qa_pairs])
     counts_text = ", ".join([f"{k}:{v}" for k, v in counts.items()])
 
     schema_hint = {
         "primary_genre": "드라마",
         "secondary_genre": "로맨스",
-        "reason": "감정선/여운을 중시하는 선택이 많고, 관계 중심 서사를 선호하는 경향이 보여요.",
-        "keywords": ["여운", "감정선", "관계", "힐링"],
+        "summary": "너는 감정선/여운을 챙기는 타입! 관계 중심 서사나 현실 공감 이야기에 잘 몰입해.",
+        "keywords": ["여운", "감정선", "관계", "현실공감"],
     }
 
     prompt = f"""
-너는 '영화 취향 심리테스트' 결과 분석가야. 사용자의 응답을 바탕으로 가장 어울리는 영화 장르를 1~2개 고르고,
-대학생 톤으로 짧고 설득력 있게 이유를 써.
+너는 '영화 취향 심리테스트' 결과 분석가야. 대학생 톤으로 짧고 깔끔하게 결과를 내.
 
-반드시 아래 JSON만 출력해(설명 문장, 코드블록, 마크다운 금지).
+반드시 아래 JSON만 출력해(설명 문장/코드블록/마크다운 금지).
 규칙:
-- primary_genre는 다음 중 하나: ["액션","코미디","드라마","SF","로맨스","판타지"]
-- secondary_genre는 위 목록 중 하나 또는 null
-- 같은 장르를 중복으로 넣지 마
-- reason은 1~2문장
-- keywords는 3~7개 한국어 키워드
+- primary_genre: ["액션","코미디","드라마","SF","로맨스","판타지"] 중 1
+- secondary_genre: 위 목록 중 1 또는 null (primary와 중복 금지)
+- summary: 사용자가 '어떤 영화'를 좋아하는지 1~2문장(가볍고 영화관 안내멘트 느낌)
+- keywords: 3~7개 한국어 키워드
 
 사용자 선택 분포: {counts_text}
 
@@ -256,43 +337,45 @@ Q&A:
 {json.dumps(schema_hint, ensure_ascii=False)}
 """.strip()
 
-    resp = client.responses.create(
-        model=model,
-        input=prompt,
-    )
+    resp = client.responses.create(model=model, input=prompt)
+    return json.loads(resp.output_text.strip())
 
-    # SDK에서 output_text 제공 (docs 기준)
-    text = resp.output_text.strip()
-    return json.loads(text)
-
-def openai_movie_reasons(
+def openai_movie_lines(
     api_key: str,
     model: str,
     profile: dict,
     movies: List[dict],
-) -> Dict[int, str]:
+) -> Dict[int, dict]:
     """
-    각 영화별 한 줄 이유 생성.
-    return: {movie_id: reason}
+    Return per movie:
+      { movie_id: {"one_liner": "...", "why": "..."} }
     """
     client = OpenAI(api_key=api_key)
 
-    # 영화 후보 정보만 간단히
     items = []
     for m in movies:
-        items.append({
-            "id": m.get("id"),
-            "title": m.get("title"),
-            "overview": (m.get("overview") or "")[:300],
-            "rating": m.get("vote_average"),
-        })
+        items.append(
+            {
+                "id": m.get("id"),
+                "title": m.get("title"),
+                "overview": clamp_text(m.get("overview") or "", 220),
+                "rating": m.get("vote_average"),
+            }
+        )
 
     prompt = f"""
-너는 영화 추천 큐레이터야. 아래 사용자 프로필(장르/키워드/이유)에 맞춰,
-각 영화마다 '왜 이 영화가 어울리는지' 한 줄(최대 25자~45자 정도)로 써.
+너는 영화 추천 큐레이터야. 아래 사용자 프로필에 맞춰,
+각 영화마다 (1) 한 줄 소개(one_liner) (2) 추천 이유(why)를 만들어.
 
 반드시 JSON 객체만 출력해.
-형식: {{"<movie_id>": "이유", ...}}
+형식:
+{{
+  "<movie_id>": {{
+     "one_liner": "어떤 영화인지 1문장(25~55자)",
+     "why": "왜 추천인지 1문장(25~55자)"
+  }},
+  ...
+}}
 
 사용자 프로필:
 {json.dumps(profile, ensure_ascii=False)}
@@ -302,34 +385,45 @@ def openai_movie_reasons(
 """.strip()
 
     resp = client.responses.create(model=model, input=prompt)
-    text = resp.output_text.strip()
-    return {int(k): v for k, v in json.loads(text).items()}
+    raw = json.loads(resp.output_text.strip())
+    return {int(k): v for k, v in raw.items()}
 
 # -----------------------------
-# Render questions
+# Question UI container
 # -----------------------------
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.subheader("🎟️ 질문에 답해주세요")
+st.caption("각 문항은 4가지 영화 취향(로맨스/드라마, 액션/어드벤처, SF/판타지, 코미디)을 반영해요.")
+
 answers: List[str] = []
 qa_pairs: List[Tuple[str, str]] = []
-
 for idx, item in enumerate(questions, start=1):
     choice = st.radio(item["q"], item["options"], key=f"q{idx}")
     answers.append(choice)
     qa_pairs.append((item["q"], choice))
+    st.write("")
 
-st.divider()
+st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("<hr/>", unsafe_allow_html=True)
 
 # -----------------------------
 # Result button
 # -----------------------------
-if st.button("결과 보기", type="primary"):
+left, right = st.columns([1, 1])
+with left:
+    go = st.button("결과 보기", type="primary")
+with right:
+    st.caption("💡 추천은 3편만 보여요. 너무 많으면 선택이 더 어려우니까!")
+
+if go:
     if not tmdb_key:
         st.warning("사이드바에 TMDB API Key를 입력해주세요.")
         st.stop()
 
     counts = compute_preference_counts(answers)
 
-    with st.spinner("분석 중..."):
-        # 1) OpenAI로 정교 분석 (가능하면), 실패하면 fallback
+    with st.spinner("분석 중... (조금만 기다려줘요)"):
+        # 1) profile: OpenAI or fallback
         profile = None
         primary_genre = None
         secondary_genre = None
@@ -339,7 +433,7 @@ if st.button("결과 보기", type="primary"):
                 profile = openai_analyze(openai_key, model_name, qa_pairs, counts)
                 primary_genre = profile.get("primary_genre")
                 secondary_genre = profile.get("secondary_genre")
-                # 안전장치
+
                 if primary_genre not in TMDB_GENRES:
                     primary_genre = None
                 if secondary_genre not in TMDB_GENRES:
@@ -347,7 +441,7 @@ if st.button("결과 보기", type="primary"):
                 if secondary_genre == primary_genre:
                     secondary_genre = None
             except Exception as e:
-                st.warning("OpenAI 분석에 실패해서 기본 로직으로 대체했어요.")
+                st.warning("OpenAI 분석에 실패해서 기본 로직으로 진행할게요.")
                 st.caption(f"OpenAI error: {e}")
 
         if not primary_genre:
@@ -355,21 +449,21 @@ if st.button("결과 보기", type="primary"):
             profile = {
                 "primary_genre": primary_genre,
                 "secondary_genre": secondary_genre,
-                "reason": "선택 분포를 기반으로 가장 강하게 드러난 취향을 골랐어요.",
+                "summary": "선택 분포를 기반으로 가장 강하게 드러난 취향을 골랐어요.",
                 "keywords": [],
             }
 
-        # 2) TMDB에서 영화 가져오기 (primary 3 + secondary 2)
-        movies: List[dict] = []
+        # 2) TMDB: only 3 movies (primary 2 + secondary 1)
         try:
-            movies += fetch_top_movies(tmdb_key, primary_genre, n=3)
+            movies: List[dict] = []
+            movies += fetch_top_movies(tmdb_key, primary_genre, n=3)[:2]  # 2편
             if secondary_genre:
-                movies += fetch_top_movies(tmdb_key, secondary_genre, n=2)
+                movies += fetch_top_movies(tmdb_key, secondary_genre, n=3)[:1]  # 1편
             else:
-                # secondary 없으면 primary로 2편 더
-                movies += fetch_top_movies(tmdb_key, primary_genre, n=5)[3:5]
+                # secondary 없으면 primary에서 1편 더
+                movies += fetch_top_movies(tmdb_key, primary_genre, n=5)[2:3]
 
-            # 중복 제거(같은 id)
+            # de-dup by id
             seen = set()
             uniq = []
             for m in movies:
@@ -377,7 +471,7 @@ if st.button("결과 보기", type="primary"):
                 if mid and mid not in seen:
                     seen.add(mid)
                     uniq.append(m)
-            movies = uniq[:5]
+            movies = uniq[:3]
         except requests.HTTPError as e:
             st.error("TMDB API 요청에 실패했어요. API Key를 확인해주세요.")
             st.caption(f"TMDB HTTPError: {e}")
@@ -387,58 +481,77 @@ if st.button("결과 보기", type="primary"):
             st.caption(str(e))
             st.stop()
 
-        # 3) 각 영화별 추천 이유 생성(OpenAI 가능하면)
-        per_movie_reason: Dict[int, str] = {}
+        # 3) OpenAI: one-liner + why (optional)
+        per_movie = {}
         if openai_key:
             try:
-                per_movie_reason = openai_movie_reasons(openai_key, model_name, profile, movies)
+                per_movie = openai_movie_lines(openai_key, model_name, profile, movies)
             except Exception as e:
-                st.warning("영화별 추천 이유 생성에 실패했어요. 기본 문구로 표시할게요.")
+                st.warning("영화 소개/이유 생성에 실패했어요. 기본 문구로 표시할게요.")
                 st.caption(f"OpenAI error: {e}")
 
     # -----------------------------
-    # Output UI
+    # Result UI
     # -----------------------------
-    st.subheader(f"🎯 당신의 추천 장르: **{primary_genre}**" + (f" + **{secondary_genre}**" if secondary_genre else ""))
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("🎞️ 당신의 결과")
+    tag = f"**{primary_genre}**" + (f" + **{secondary_genre}**" if secondary_genre else "")
+    st.write(f"추천 장르: {tag}")
     st.caption(
         f"선택 분포: 로맨스/드라마 {counts['로맨스/드라마']} · "
         f"액션/어드벤처 {counts['액션/어드벤처']} · "
         f"SF/판타지 {counts['SF/판타지']} · "
         f"코미디 {counts['코미디']}"
     )
-    st.write("**요약 분석:**", profile.get("reason", ""))
+
+    st.write("**어떤 영화 취향이냐면:**")
+    st.write(profile.get("summary", ""))
+
     kws = profile.get("keywords") or []
     if kws:
-        st.write("**키워드:**", " · ".join(kws))
+        st.write("**키워드:** " + " · ".join(kws))
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("🍿 지금 인기 있는 추천 영화 5편")
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.subheader("🍿 오늘의 추천 3편")
+    st.caption("너무 많이 추천하지 않고, 지금 바로 보기 좋은 작품만 골랐어요.")
 
-    # 카드형 표시
     for m in movies:
+        mid = m.get("id")
         title = m.get("title") or "제목 없음"
         rating = float(m.get("vote_average") or 0.0)
-        overview = m.get("overview") or "줄거리 정보가 없어요."
+        overview = m.get("overview") or ""
         poster_url = build_poster_url(m.get("poster_path"))
-        mid = m.get("id")
 
-        with st.container(border=True):
-            cols = st.columns([1, 2.2])
-            with cols[0]:
-                if poster_url:
-                    st.image(poster_url, use_container_width=True)
-                else:
-                    st.write("🖼️ 포스터 없음")
-            with cols[1]:
-                st.markdown(f"### {title}")
-                st.write(f"⭐ 평점: {rating:.1f} / 10")
-                st.write(overview)
+        # fallback lines
+        one_liner = clamp_text(overview, 60) or "한 줄 소개를 준비 중이에요."
+        why = f"당신의 **{primary_genre}** 취향 포인트와 잘 맞는 인기작이라 추천해요."
+        if secondary_genre:
+            why = f"당신의 **{primary_genre}/{secondary_genre}** 취향을 만족시킬 가능성이 높아요."
 
-                # 영화별 이유
-                why = per_movie_reason.get(mid)
-                if not why:
-                    # 기본 문구(오프라인)
-                    why = f"당신의 **{primary_genre}** 성향과 잘 맞는 인기 작품이라 추천해요."
-                    if secondary_genre:
-                        why = f"당신의 **{primary_genre}/{secondary_genre}** 취향 포인트를 채워줄 가능성이 높아요."
-                st.write("**이 영화를 추천하는 이유:**", why)
+        if isinstance(per_movie, dict) and mid in per_movie:
+            one_liner = per_movie[mid].get("one_liner") or one_liner
+            why = per_movie[mid].get("why") or why
+
+        st.markdown('<div class="movie-card">', unsafe_allow_html=True)
+        cols = st.columns([1, 2.2], vertical_alignment="top")
+        with cols[0]:
+            if poster_url:
+                st.image(poster_url, use_container_width=True)
+            else:
+                st.write("🖼️ 포스터 없음")
+        with cols[1]:
+            st.markdown(f"### {title}")
+            st.write(f"⭐ 평점: {rating:.1f} / 10")
+            st.markdown(f"**한 줄 소개:** {one_liner}")
+            st.markdown(f"**추천 이유:** {why}")
+
+            if overview.strip():
+                with st.expander("줄거리 더 보기"):
+                    st.write(overview)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.write("")
+
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.caption("원하면 다음 단계에서 ‘대표 1편만 픽’ 또는 ‘장르 혼합 검색(예: SF+로맨스)’로 더 정밀하게도 만들 수 있어요.")
