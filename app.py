@@ -1,61 +1,188 @@
-import os
 import datetime as dt
+import json
+import math
+import os
+import re
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
-# openai는 설치만(다음 시간 연동용). 지금 코드에서는 사용하지 않음.
+# openai는 설치만(다음 시간 추천/대화 모델 연동용). 지금은 호출하지 않음.
 from openai import OpenAI  # noqa: F401
 
 
-# -----------------------------
-# Models
-# -----------------------------
+# =========================
+# Data models
+# =========================
 @dataclass
 class Weather:
     city: str
     temp_c: float
-    feels_like_c: float
+    feels_c: float
     humidity: int
     wind_ms: float
     rain: bool
-    description: str
+    desc: str
 
 
-# -----------------------------
-# Weather helpers (no external deps)
-# -----------------------------
-def temp_band(feels_like_c: float) -> str:
-    if feels_like_c <= 0:
+@dataclass
+class EventTPO:
+    title: str
+    start: Optional[dt.datetime]
+    tags: List[str]
+
+
+# =========================
+# Secrets / env helpers
+# =========================
+def get_secret(key: str, default: str = "") -> str:
+    # Streamlit Cloud Secrets 우선
+    try:
+        return str(st.secrets.get(key, default))
+    except Exception:
+        return os.getenv(key, default)
+
+
+def get_default_city() -> str:
+    return get_secret("DEFAULT_CITY", "Seoul,KR")
+
+
+def get_openweather_key() -> str:
+    return get_secret("OPENWEATHER_API_KEY", "")
+
+
+# =========================
+# Weather
+# =========================
+def fetch_openweather(city: str, api_key: str) -> Tuple[bool, Dict]:
+    if not api_key:
+        return False, {"error": "OPENWEATHER_API_KEY가 없어 수동 날씨 모드로 진행합니다."}
+
+    try:
+        base = "https://api.openweathermap.org/data/2.5/weather"
+        qs = urllib.parse.urlencode({"q": city, "appid": api_key, "units": "metric", "lang": "kr"})
+        url = f"{base}?{qs}"
+
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+
+        data = json.loads(raw)
+
+        temp_c = float(data["main"]["temp"])
+        feels_c = float(data["main"]["feels_like"])
+        humidity = int(data["main"]["humidity"])
+        wind_ms = float(data.get("wind", {}).get("speed", 0.0))
+        desc = (data.get("weather", [{}])[0].get("description") or "정보 없음").strip()
+
+        rain = False
+        if isinstance(data.get("rain"), dict):
+            rain = float(data["rain"].get("1h", 0.0)) > 0.0
+        if "비" in desc or "눈" in desc:
+            rain = True
+
+        return True, {
+            "weather": Weather(
+                city=city,
+                temp_c=temp_c,
+                feels_c=feels_c,
+                humidity=humidity,
+                wind_ms=wind_ms,
+                rain=rain,
+                desc=desc,
+            )
+        }
+    except Exception as e:
+        return False, {"error": f"날씨 자동 조회 실패: {e}"}
+
+
+def temp_band(feels_c: float) -> str:
+    if feels_c <= 0:
         return "매우 추움"
-    if feels_like_c <= 8:
+    if feels_c <= 8:
         return "추움"
-    if feels_like_c <= 16:
+    if feels_c <= 16:
         return "쌀쌀"
-    if feels_like_c <= 23:
+    if feels_c <= 23:
         return "적당"
-    if feels_like_c <= 29:
+    if feels_c <= 29:
         return "더움"
     return "매우 더움"
 
 
+# =========================
+# Calendar (ICS) - stdlib parsing
+# =========================
+def fetch_ics_from_url(url: str) -> Tuple[bool, bytes]:
+    try:
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            return True, resp.read()
+    except Exception as e:
+        return False, str(e).encode("utf-8", errors="ignore")
+
+
+def parse_ics_minimal(ics_bytes: bytes, target_date: dt.date) -> List[EventTPO]:
+    """
+    외부 패키지 없이 돌아가는 '미니' ICS 파서.
+    - SUMMARY, DTSTART를 대충 읽어서 target_date 해당 이벤트만 추출
+    - 복잡한 recurrence/zone은 완벽 지원 X (MVP)
+    """
+    text = ics_bytes.decode("utf-8", errors="ignore")
+    # 줄바꿈 이어쓰기(ICS folding) 처리: \n + 공백 시작은 이어진 줄
+    text = re.sub(r"\r\n[ \t]", "", text)
+
+    blocks = re.findall(r"BEGIN:VEVENT(.*?)END:VEVENT", text, flags=re.DOTALL)
+    events: List[EventTPO] = []
+
+    for b in blocks:
+        # SUMMARY
+        m_sum = re.search(r"SUMMARY:(.*)", b)
+        title = m_sum.group(1).strip() if m_sum else "Untitled"
+
+        # DTSTART (예: DTSTART:20260208T090000Z / DTSTART:20260208 / DTSTART;TZID=Asia/Seoul:20260208T090000)
+        m_dt = re.search(r"DTSTART[^:]*:(\d{8})(T(\d{6}))?(Z)?", b)
+        start_dt = None
+        if m_dt:
+            ymd = m_dt.group(1)
+            hms = m_dt.group(3)  # HHMMSS
+            if hms:
+                hh = int(hms[0:2]); mm = int(hms[2:4]); ss = int(hms[4:6])
+                start_dt = dt.datetime(int(ymd[0:4]), int(ymd[4:6]), int(ymd[6:8]), hh, mm, ss)
+            else:
+                start_dt = dt.datetime(int(ymd[0:4]), int(ymd[4:6]), int(ymd[6:8]), 9, 0, 0)
+
+            ev_date = start_dt.date()
+            if ev_date != target_date:
+                continue
+        else:
+            # DTSTART가 없으면 스킵
+            continue
+
+        tags = infer_tpo_tags(title)
+        events.append(EventTPO(title=title, start=start_dt, tags=tags))
+
+    # 시간순 정렬
+    events.sort(key=lambda x: x.start or dt.datetime.max)
+    return events
+
+
 def infer_tpo_tags(text: str) -> List[str]:
-    """
-    일정/텍스트 기반 간단 TPO 태그 추론(룰 기반).
-    """
     t = (text or "").lower()
     tags: List[str] = []
 
     if any(k in t for k in ["면접", "interview"]):
         tags += ["formal", "smart"]
-    if any(k in t for k in ["발표", "presentation", "피칭", "pitch", "회의", "미팅"]):
-        tags += ["smart", "formal"]
+    if any(k in t for k in ["발표", "presentation", "피칭", "pitch", "회의", "미팅", "컨퍼런스", "세미나"]):
+        tags += ["formal", "smart"]
     if any(k in t for k in ["결혼식", "웨딩", "wedding", "연회", "행사"]):
         tags += ["formal"]
-    if any(k in t for k in ["데이트", "date", "소개팅", "모임"]):
+    if any(k in t for k in ["데이트", "date", "소개팅", "와인", "레스토랑"]):
         tags += ["date", "smart"]
-    if any(k in t for k in ["등산", "hiking", "캠핑", "camp", "야외", "outdoor"]):
+    if any(k in t for k in ["친구", "모임", "파티"]):
+        tags += ["smart", "casual"]
+    if any(k in t for k in ["등산", "hiking", "캠핑", "camp", "야외", "outdoor", "피크닉"]):
         tags += ["outdoor", "casual"]
     if any(k in t for k in ["운동", "gym", "러닝", "run", "필라테스", "요가"]):
         tags += ["sport", "casual"]
@@ -63,271 +190,392 @@ def infer_tpo_tags(text: str) -> List[str]:
     if not tags:
         tags = ["casual"]
 
-    # dedupe
     return list(dict.fromkeys(tags))
 
 
-def get_env_default_city() -> str:
-    return os.getenv("DEFAULT_CITY", "Seoul,KR")
+# =========================
+# Outfit engine (rule-based MVP)
+# =========================
+WARDROBE = {
+    "tops": [
+        {"name": "화이트 셔츠", "tags": ["formal", "smart", "neutral"], "warmth": 2},
+        {"name": "블랙 니트", "tags": ["smart", "casual", "black"], "warmth": 4},
+        {"name": "맨투맨", "tags": ["casual"], "warmth": 3},
+        {"name": "후드티", "tags": ["casual", "street"], "warmth": 4},
+    ],
+    "bottoms": [
+        {"name": "슬랙스", "tags": ["formal", "smart"], "warmth": 2},
+        {"name": "청바지", "tags": ["casual"], "warmth": 2},
+        {"name": "조거팬츠", "tags": ["sport", "casual"], "warmth": 2},
+    ],
+    "outer": [
+        {"name": "트렌치코트", "tags": ["formal", "smart"], "warmth": 3, "rain_ok": True},
+        {"name": "자켓(블레이저)", "tags": ["formal", "smart"], "warmth": 3},
+        {"name": "패딩", "tags": ["casual"], "warmth": 6, "rain_ok": True},
+        {"name": "바람막이", "tags": ["outdoor", "sport", "casual"], "warmth": 2, "rain_ok": True},
+    ],
+    "shoes": [
+        {"name": "로퍼", "tags": ["formal", "smart"], "rain_ok": False},
+        {"name": "스니커즈", "tags": ["casual", "street", "sport"], "rain_ok": True},
+    ],
+    "extras": [
+        {"name": "우산", "tags": ["rain"]},
+        {"name": "머플러", "tags": ["cold"]},
+    ],
+}
 
 
-def get_env_openweather_key() -> str:
-    return os.getenv("OPENWEATHER_API_KEY", "")
+def ideal_warmth(feels_c: float) -> float:
+    band = temp_band(feels_c)
+    return {
+        "매우 추움": 6,
+        "추움": 5,
+        "쌀쌀": 3.5,
+        "적당": 2.5,
+        "더움": 1.5,
+        "매우 더움": 0.5,
+    }[band]
 
 
-# -----------------------------
-# Optional: OpenWeather fetch (only if key exists)
-# - We will NOT require requests package.
-# - Use urllib from stdlib.
-# -----------------------------
-def fetch_openweather(city: str, api_key: str) -> Tuple[bool, Dict]:
+def score_item(item: Dict, wanted_tags: List[str], prefs: Dict, weather: Weather) -> float:
+    score = 0.0
+    name = str(item.get("name", "")).lower()
+    tags = item.get("tags", [])
+    warmth = float(item.get("warmth", 0))
+
+    # tag match
+    for t in wanted_tags:
+        if t in tags:
+            score += 2.0
+
+    # color preference
+    color = prefs.get("preferred_color", "neutral")
+    if color == "neutral" and "neutral" in tags:
+        score += 0.8
+    if color == "black" and ("black" in tags or "dark" in tags):
+        score += 0.8
+    if color == "pastel" and "pastel" in tags:
+        score += 0.8
+    if color == "vivid" and "vivid" in tags:
+        score += 0.8
+
+    # warmth closeness
+    ideal = ideal_warmth(weather.feels_c)
+    score += max(0.0, 2.5 - abs(warmth - ideal))
+
+    # rain compatibility
+    if weather.rain:
+        if item.get("rain_ok", False):
+            score += 1.0
+        else:
+            score -= 1.0
+
+    # banned keywords
+    for b in prefs.get("banned_keywords", []):
+        if b.lower() in name:
+            score -= 6.0
+
+    # explicit avoid shoes
+    avoid_shoes = prefs.get("avoid_shoes", [])
+    for s in avoid_shoes:
+        if s.lower() in name:
+            score -= 5.0
+
+    return score
+
+
+def pick_best(items: List[Dict], wanted_tags: List[str], prefs: Dict, weather: Weather) -> Optional[Dict]:
+    if not items:
+        return None
+    ranked = sorted(((score_item(it, wanted_tags, prefs, weather), it) for it in items), key=lambda x: x[0], reverse=True)
+    return ranked[0][1]
+
+
+def build_outfit(weather: Weather, tpo_tags: List[str], prefs: Dict) -> Tuple[Dict, List[str]]:
     """
-    OpenWeather Current Weather API.
-    Uses stdlib urllib only. If fails, return ok=False.
+    Returns: (outfit dict, reasons list)
     """
-    try:
-        import json
-        import urllib.parse
-        import urllib.request
+    # combine tags
+    wanted = list(dict.fromkeys(tpo_tags + prefs.get("preferred_style", [])))
 
-        if not api_key:
-            return False, {"error": "OPENWEATHER_API_KEY가 없습니다. 수동 입력으로 진행합니다."}
+    top = pick_best(WARDROBE["tops"], wanted, prefs, weather)
+    bottom = pick_best(WARDROBE["bottoms"], wanted, prefs, weather)
+    shoes = pick_best(WARDROBE["shoes"], wanted, prefs, weather)
 
-        base = "https://api.openweathermap.org/data/2.5/weather"
-        qs = urllib.parse.urlencode(
-            {"q": city, "appid": api_key, "units": "metric", "lang": "kr"}
-        )
-        url = f"{base}?{qs}"
+    need_outer = weather.feels_c <= 16 or weather.rain or weather.wind_ms >= 7
+    outer = pick_best(WARDROBE["outer"], wanted, prefs, weather) if need_outer else None
 
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-        data = json.loads(raw)
+    extras = []
+    if weather.rain:
+        extras.append({"name": "우산"})
+    if weather.feels_c <= 8:
+        extras.append({"name": "머플러"})
 
-        temp_c = float(data["main"]["temp"])
-        feels = float(data["main"]["feels_like"])
-        humidity = int(data["main"]["humidity"])
-        wind = float(data.get("wind", {}).get("speed", 0.0))
-        desc = (data.get("weather", [{}])[0].get("description") or "정보 없음").strip()
+    outfit = {
+        "top": top,
+        "bottom": bottom,
+        "outer": outer,
+        "shoes": shoes,
+        "extras": extras,
+    }
 
-        # rain 여부만 간단 판단
-        rain = False
-        if isinstance(data.get("rain"), dict):
-            rain = float(data["rain"].get("1h", 0.0)) > 0.0
-        if "비" in desc or "눈" in desc:
-            rain = True
+    # reasons
+    reasons = []
+    reasons.append(f"오늘 체감온도 **{weather.feels_c:.1f}℃({temp_band(weather.feels_c)})**에 맞춰 보온/레이어링을 고려했어요.")
+    if weather.rain:
+        reasons.append("비/눈 가능성이 있어 **젖어도 괜찮은 선택(우산/레인 대응)**을 우선했어요.")
+    if tpo_tags:
+        reasons.append(f"캘린더 일정에서 추론한 TPO가 **{', '.join(tpo_tags)}**라서 그 무드에 맞췄어요.")
+    if prefs.get("preferred_style"):
+        reasons.append(f"사용자 선호 스타일(**{', '.join(prefs['preferred_style'])}**)을 반영했어요.")
+    if prefs.get("preferred_color"):
+        reasons.append(f"선호 컬러 톤(**{prefs['preferred_color']}**)을 가능한 범위에서 우선했어요.")
+    if prefs.get("banned_keywords"):
+        reasons.append(f"피하고 싶은 요소(**{', '.join(prefs['banned_keywords'])}**)를 제외하려고 했어요.")
 
-        w = Weather(
-            city=city,
-            temp_c=temp_c,
-            feels_like_c=feels,
-            humidity=humidity,
-            wind_ms=wind,
-            rain=rain,
-            description=desc,
-        )
-        return True, {"weather": w}
-    except Exception as e:
-        return False, {"error": f"날씨 자동 조회 실패: {e}"}
+    return outfit, reasons
 
 
-# -----------------------------
+# =========================
+# Chat-based preference updates (simple rules)
+# =========================
+def apply_chat_update(text: str, prefs: Dict) -> Dict:
+    t = (text or "").strip().lower()
+    if not t:
+        return prefs
+
+    # style nudges
+    if any(k in t for k in ["포멀", "격식", "깔끔", "정장"]):
+        prefs["preferred_style"] = list(dict.fromkeys((prefs.get("preferred_style", []) + ["formal", "smart"])))
+    if any(k in t for k in ["캐주얼", "편하게"]):
+        prefs["preferred_style"] = list(dict.fromkeys((prefs.get("preferred_style", []) + ["casual"])))
+    if any(k in t for k in ["스트릿"]):
+        prefs["preferred_style"] = list(dict.fromkeys((prefs.get("preferred_style", []) + ["street", "casual"])))
+    if any(k in t for k in ["운동", "스포츠", "활동적"]):
+        prefs["preferred_style"] = list(dict.fromkeys((prefs.get("preferred_style", []) + ["sport", "casual"])))
+
+    # warmth
+    if any(k in t for k in ["따뜻", "보온", "추워"]):
+        prefs["warmth_bias"] = prefs.get("warmth_bias", 0.0) + 0.5
+    if any(k in t for k in ["시원", "가볍", "덥"]):
+        prefs["warmth_bias"] = prefs.get("warmth_bias", 0.0) - 0.5
+
+    # colors
+    if "검정" in t or "블랙" in t:
+        if any(k in t for k in ["빼", "제외", "말고", "싫"]):
+            prefs["banned_keywords"] = list(dict.fromkeys(prefs.get("banned_keywords", []) + ["블랙", "black"]))
+        else:
+            prefs["preferred_color"] = "black"
+    if "뉴트럴" in t or "무채색" in t:
+        prefs["preferred_color"] = "neutral"
+    if "파스텔" in t:
+        prefs["preferred_color"] = "pastel"
+    if "비비드" in t or "쨍" in t:
+        prefs["preferred_color"] = "vivid"
+
+    # shoes constraints
+    if "로퍼" in t and any(k in t for k in ["말고", "빼", "제외"]):
+        prefs["avoid_shoes"] = list(dict.fromkeys(prefs.get("avoid_shoes", []) + ["로퍼"]))
+    if "운동화" in t and any(k in t for k in ["말고", "빼", "제외"]):
+        prefs["avoid_shoes"] = list(dict.fromkeys(prefs.get("avoid_shoes", []) + ["스니커즈"]))
+
+    # generic bans: "OO 빼줘"
+    m = re.findall(r"([가-힣a-z0-9]+)\s*(빼|제외|싫어|말고)", t)
+    for word, _ in m:
+        if len(word) >= 2:
+            prefs["banned_keywords"] = list(dict.fromkeys(prefs.get("banned_keywords", []) + [word]))
+
+    return prefs
+
+
+# =========================
 # Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="OOTD (날씨+요구사항+TPO) MVP", page_icon="👕", layout="wide")
-st.title("👕 OOTD 추천 화면 (MVP)")
-st.caption("패키지: streamlit + openai만 설치한 상태에서도 동작하는 UI 버전 (API 없으면 수동 입력).")
+# =========================
+st.set_page_config(page_title="OOTD (날씨+TPO 자동반영)", page_icon="👕", layout="wide")
+st.title("👕 오늘의 OOTD")
+st.caption("날씨 + 캘린더(TPO) 자동 반영 + 채팅으로 수정 반영 (MVP)")
 
-# Session init
-if "answers" not in st.session_state:
-    st.session_state.answers = {}
-if "weather" not in st.session_state:
-    st.session_state.weather = None
-if "tpo_tags" not in st.session_state:
-    st.session_state.tpo_tags = []
+# session init
+if "prefs" not in st.session_state:
+    st.session_state.prefs = {
+        "preferred_style": ["casual"],
+        "preferred_color": "neutral",
+        "banned_keywords": [],
+        "avoid_shoes": [],
+        "warmth_bias": 0.0,
+    }
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 
-# -----------------------------
-# Sidebar
-# -----------------------------
+# -------------------------
+# Sidebar: weather + prefs + calendar
+# -------------------------
 with st.sidebar:
     st.header("설정")
 
-    selected_date = st.date_input("날짜", value=dt.date.today())
+    target_date = st.date_input("추천 날짜", value=dt.date.today())
 
-    st.subheader("🌦️ 날씨 (API 없으면 수동 입력)")
-    city = st.text_input("도시", value=get_env_default_city())
-
-    api_key = get_env_openweather_key().strip()
+    # Weather section
+    st.subheader("🌦️ 날씨")
+    city = st.text_input("도시", value=get_default_city())
+    api_key = get_openweather_key().strip()
     auto_available = bool(api_key)
 
     if auto_available:
         weather_mode = st.radio("날씨 모드", ["자동(OpenWeather)", "수동"], index=0)
     else:
-        st.info("OPENWEATHER_API_KEY가 없어 수동 입력 모드로만 동작합니다.")
+        st.info("OPENWEATHER_API_KEY가 없어 수동 날씨 입력만 가능합니다.")
         weather_mode = "수동"
 
-    # Manual inputs
-    manual_temp = st.slider("기온(℃)", -20, 45, 16)
-    manual_feels = st.slider("체감(℃)", -20, 45, 15)
-    manual_humidity = st.slider("습도(%)", 0, 100, 50)
-    manual_wind = st.slider("바람(m/s)", 0.0, 20.0, 1.5, step=0.1)
-    manual_rain = st.selectbox("강수", ["없음", "비/눈 가능"], index=0)
-    manual_desc = st.text_input("날씨 설명(선택)", value="맑음")
+    # manual inputs always visible (fallback)
+    m_temp = st.slider("기온(℃)", -20, 45, 16)
+    m_feels = st.slider("체감(℃)", -20, 45, 15)
+    m_hum = st.slider("습도(%)", 0, 100, 50)
+    m_wind = st.slider("바람(m/s)", 0.0, 20.0, 1.5, step=0.1)
+    m_rain = st.selectbox("강수", ["없음", "비/눈 가능"], index=0)
+    m_desc = st.text_input("날씨 설명(선택)", value="맑음")
 
-    st.subheader("🙋 사용자 요구사항")
-    preferred_style = st.multiselect(
-        "선호 스타일",
-        ["casual", "formal", "smart", "street", "outdoor", "sport", "date", "minimal"],
-        default=["casual"],
-    )
-    preferred_color = st.radio(
-        "선호 컬러 톤",
-        ["neutral", "black", "pastel", "vivid"],
-        index=0,
-        horizontal=True,
-    )
-    banned_keywords = st.text_input("피하고 싶은 키워드(쉼표로 구분)", value="")
-
-    st.subheader("📅 캘린더(TPO) — 수동 입력 버전")
-    st.caption("외부 패키지 없이 구현: 일정 텍스트 입력 → TPO 태그 추론")
-    calendar_text = st.text_area(
-        "오늘 일정/장소/상황을 적어주세요",
-        placeholder="예: 14:00 팀 발표 / 19:00 친구 모임 / 야외 산책",
-        height=120,
-    )
-    manual_tpo = st.text_input("TPO 키워드(선택)", placeholder="예: 면접, 발표, 데이트, 등산, 운동")
-
-    # Build Weather object
-    weather_error = None
-    weather: Optional[Weather] = None
+    weather_err = None
+    weather: Weather
 
     if weather_mode.startswith("자동"):
         ok, payload = fetch_openweather(city, api_key)
         if ok:
             weather = payload["weather"]
         else:
-            weather_error = payload["error"]
-            # fallback to manual
+            weather_err = payload["error"]
             weather_mode = "수동"
 
     if weather_mode == "수동":
         weather = Weather(
             city=city,
-            temp_c=float(manual_temp),
-            feels_like_c=float(manual_feels),
-            humidity=int(manual_humidity),
-            wind_ms=float(manual_wind),
-            rain=(manual_rain != "없음"),
-            description=(manual_desc.strip() or "정보 없음"),
+            temp_c=float(m_temp),
+            feels_c=float(m_feels),
+            humidity=int(m_hum),
+            wind_ms=float(m_wind),
+            rain=(m_rain != "없음"),
+            desc=(m_desc.strip() or "정보 없음"),
         )
 
-    # TPO tags
-    tpo_text = (calendar_text or "") + " " + (manual_tpo or "")
-    tpo_tags = infer_tpo_tags(tpo_text)
+    if weather_err:
+        st.warning(weather_err)
 
-    # Save session
-    st.session_state.weather = weather
-    st.session_state.tpo_tags = tpo_tags
+    # Preferences section
+    st.subheader("🙋 사용자 요구사항")
+    preferred_style = st.multiselect(
+        "선호 스타일",
+        ["casual", "formal", "smart", "street", "outdoor", "sport", "date", "minimal"],
+        default=st.session_state.prefs.get("preferred_style", ["casual"]),
+    )
+    preferred_color = st.radio(
+        "선호 컬러 톤",
+        ["neutral", "black", "pastel", "vivid"],
+        index=["neutral", "black", "pastel", "vivid"].index(st.session_state.prefs.get("preferred_color", "neutral")),
+        horizontal=True,
+    )
+    banned_text = st.text_input("피하고 싶은 키워드(쉼표)", value=",".join(st.session_state.prefs.get("banned_keywords", [])))
 
-    user_prefs = {
-        "selected_date": selected_date,
-        "preferred_style": preferred_style,
-        "preferred_color": preferred_color,
-        "banned_keywords": [x.strip() for x in banned_keywords.split(",") if x.strip()],
-        "calendar_text": calendar_text.strip(),
-        "manual_tpo": manual_tpo.strip(),
-        "weather_mode": weather_mode,
-        "weather_error": weather_error,
-    }
+    st.session_state.prefs["preferred_style"] = preferred_style
+    st.session_state.prefs["preferred_color"] = preferred_color
+    st.session_state.prefs["banned_keywords"] = [x.strip() for x in banned_text.split(",") if x.strip()]
 
+    # Calendar section
+    st.subheader("📅 캘린더 연동(TPO 자동)")
+    st.caption("외부 패키지 없이: ① ICS 파일 업로드 또는 ② iCal(ICS) 공개 URL로 연동")
 
-# -----------------------------
-# Main: Summary panels
-# -----------------------------
-col1, col2 = st.columns([1.1, 1.4])
+    ics_file = st.file_uploader("ICS 파일 업로드(.ics)", type=["ics"])
+    ics_url = st.text_input("iCal(ICS) 공개 URL(선택)", value="", placeholder="https://.../calendar.ics")
 
-with col1:
-    st.subheader("🌦️ 날씨 요약")
-    if user_prefs["weather_error"]:
-        st.warning(user_prefs["weather_error"])
-        st.info("자동 조회 실패 시 수동 입력값으로 대체됩니다.")
+    events: List[EventTPO] = []
+    if ics_file is not None:
+        events = parse_ics_minimal(ics_file.getvalue(), target_date)
+    elif ics_url.strip():
+        ok, b = fetch_ics_from_url(ics_url.strip())
+        if ok:
+            events = parse_ics_minimal(b, target_date)
+        else:
+            st.warning("ICS URL을 가져오지 못했습니다. URL이 공개/접근 가능해야 합니다.")
 
-    w = st.session_state.weather
-    if w:
-        st.metric("기온(℃)", f"{w.temp_c:.1f}")
-        st.metric("체감(℃)", f"{w.feels_like_c:.1f}")
-        st.write(f"- 도시: **{w.city}**")
-        st.write(f"- 상태: **{w.description}**")
-        st.write(f"- 습도: **{w.humidity}%**")
-        st.write(f"- 바람: **{w.wind_ms:.1f} m/s**")
-        st.write(f"- 강수: **{'있음(우산 추천)' if w.rain else '없음'}**")
-        st.write(f"- 체감 구간: **{temp_band(w.feels_like_c)}**")
-        st.write(f"- 모드: **{user_prefs['weather_mode']}**")
+    # pick event for the date
+    chosen_event = events[0] if events else None
+    tpo_tags = chosen_event.tags if chosen_event else ["casual"]
 
-with col2:
-    st.subheader("📅 TPO 요약")
-    st.write(f"- 날짜: **{user_prefs['selected_date']}**")
-    if user_prefs["calendar_text"]:
-        st.write(f"- 일정 텍스트: {user_prefs['calendar_text']}")
-    if user_prefs["manual_tpo"]:
-        st.write(f"- 추가 TPO 키워드: **{user_prefs['manual_tpo']}**")
-    st.write(f"- 추론 태그: **{', '.join(st.session_state.tpo_tags)}**")
+    if chosen_event:
+        st.success(f"자동 반영: {chosen_event.title}")
+        st.write(f"TPO 태그: {', '.join(tpo_tags)}")
+    else:
+        st.info("해당 날짜에 감지된 일정이 없어 기본 TPO(casual)로 진행합니다.")
+
+# -------------------------
+# Main view: show outfit + reasons
+# -------------------------
+outfit, reasons = build_outfit(weather, tpo_tags, st.session_state.prefs)
+
+top, bottom, outer, shoes = outfit["top"], outfit["bottom"], outfit["outer"], outfit["shoes"]
+extras = outfit["extras"]
+
+c1, c2 = st.columns([1.2, 1.0])
+
+with c1:
+    st.subheader("오늘의 추천 코디")
+    st.write(f"**도시:** {weather.city}  |  **날씨:** {weather.desc}  |  **체감:** {weather.feels_c:.1f}℃ ({temp_band(weather.feels_c)})")
+    if chosen_event:
+        st.write(f"**캘린더 일정 자동 반영:** {chosen_event.title}  →  **TPO:** {', '.join(tpo_tags)}")
+    else:
+        st.write(f"**TPO:** {', '.join(tpo_tags)}")
+
+    card1, card2, card3, card4 = st.columns(4)
+    with card1:
+        st.markdown("### 👕 상의")
+        st.write(top["name"] if top else "추천 없음")
+    with card2:
+        st.markdown("### 👖 하의")
+        st.write(bottom["name"] if bottom else "추천 없음")
+    with card3:
+        st.markdown("### 🧥 아우터")
+        st.write(outer["name"] if outer else "필요 없음/추천 없음")
+    with card4:
+        st.markdown("### 👟 신발")
+        st.write(shoes["name"] if shoes else "추천 없음")
+
+    if extras:
+        st.markdown("### 🎒 추가 아이템")
+        st.write(", ".join([x["name"] for x in extras]))
+
+with c2:
+    st.subheader("왜 이렇게 추천했나요?")
+    for r in reasons:
+        st.write(f"- {r}")
 
 st.divider()
 
-# -----------------------------
-# Questions: 5 radios, 4 options each
-# (이전 버전에서 만든 질문을 그대로 사용)
-# -----------------------------
-st.subheader("🧩 오늘의 코디 질문 (5개)")
+# -------------------------
+# Chat: apply modifications
+# -------------------------
+st.subheader("💬 수정사항을 채팅으로 반영하기")
+st.caption("예) “좀 더 포멀하게”, “캐주얼하게”, “검정 빼줘”, “따뜻하게”, “운동화 말고 로퍼”, “비 오는 날이라 젖기 싫어”")
 
-QUESTIONS = [
-    ("Q1. 오늘 주요 상황(TPO)은?", ["출근/등교", "격식(발표/행사/면접)", "데이트/모임", "운동/야외활동"]),
-    ("Q2. 선호하는 무드는?", ["미니멀", "캐주얼", "스트릿", "포멀"]),
-    ("Q3. 선호 컬러 톤은?", ["뉴트럴", "블랙톤", "파스텔", "비비드"]),
-    ("Q4. 체감 온도 성향은?", ["추위 많이 탐", "보통", "더위 많이 탐", "레이어링 좋아함"]),
-    ("Q5. 오늘 피하고 싶은 요소는?", ["구김/관리 어려움", "활동성 떨어짐", "통풍/땀 문제", "비/오염 취약"]),
-]
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
 
-for q, options in QUESTIONS:
-    st.session_state.answers[q] = st.radio(q, options, index=0, key=q)
+user_text = st.chat_input("수정사항을 입력해줘…")
+if user_text:
+    st.session_state.messages.append({"role": "user", "content": user_text})
+    st.session_state.prefs = apply_chat_update(user_text, st.session_state.prefs)
 
-st.divider()
+    # After update, rebuild outfit
+    outfit2, reasons2 = build_outfit(weather, tpo_tags, st.session_state.prefs)
 
-# -----------------------------
-# Reflect sidebar prefs
-# -----------------------------
-st.subheader("🙋 사용자 요구사항(사이드바 입력) 반영 요약")
-a, b = st.columns(2)
+    # assistant response (간단 안내)
+    assistant_msg = "수정사항을 반영해서 추천을 업데이트했어요. (화면이 새로고침되며 최신 코디가 표시됩니다.)"
+    st.session_state.messages.append({"role": "assistant", "content": assistant_msg})
 
-with a:
-    styles = user_prefs["preferred_style"]
-    st.write(f"- 선호 스타일: **{', '.join(styles) if styles else '없음'}**")
-    st.write(f"- 선호 컬러 톤: **{user_prefs['preferred_color']}**")
+    st.rerun()
 
-with b:
-    banned = user_prefs["banned_keywords"]
-    st.write(f"- 피하고 싶은 키워드: **{', '.join(banned) if banned else '없음'}**")
-    st.write(f"- TPO 태그: **{', '.join(st.session_state.tpo_tags)}**")
-
-st.divider()
-
-# -----------------------------
-# Result button
-# -----------------------------
-if st.button("결과 보기", type="primary"):
-    st.info("분석 중...")
-
-    # 다음 시간에 들어갈 자리:
-    # - (OpenAI/추천 API) 호출
-    # - 날씨 + 선호 + 금지 + TPO + 질문답 합쳐서 추천 생성
-    # 지금은 요구사항대로 "분석 중..."만 표시
-
-# -----------------------------
-# Debug (optional)
-# -----------------------------
-with st.expander("🔎 현재 입력값(디버그)"):
-    st.write("Weather:", st.session_state.weather)
-    st.write("TPO tags:", st.session_state.tpo_tags)
-    st.write("User prefs:", user_prefs)
-    st.write("Answers:", st.session_state.answers)
+with st.expander("🔎 현재 상태(디버그)"):
+    st.write("weather:", weather)
+    st.write("tpo_tags:", tpo_tags)
+    st.write("prefs:", st.session_state.prefs)
+    st.write("chosen_event:", chosen_event.title if chosen_event else None)
