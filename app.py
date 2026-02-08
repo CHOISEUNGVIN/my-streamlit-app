@@ -224,7 +224,7 @@ def normalize_wardrobe(w: Dict) -> Dict:
 
 
 # =========================
-# Free-text preference (Style DNA) + color extraction
+# Free-text mood/style extraction
 # =========================
 STYLE_KEYWORDS = {
     "미니멀": ["minimal", "미니멀", "깔끔", "심플", "정갈"],
@@ -258,15 +258,20 @@ COLOR_KEYWORDS = {
 NEGATION_HINTS = ["빼", "제외", "싫", "말고", "no ", "not "]
 
 
-def extract_signals_from_style_dna(style_dna: str) -> Dict[str, List[str]]:
-    s = (style_dna or "").lower()
+def extract_signals_from_text(bundle_text: str) -> Dict[str, List[str]]:
+    s = (bundle_text or "").lower()
+
     prefer, avoid = [], []
     prefer_colors, avoid_colors = [], []
+    banned_keywords = []
 
+    # 1) "OO 빼줘/제외/싫/말고" -> 강한 회피 신호
     for word, _ in re.findall(r"([가-힣a-z0-9]+)\s*(빼|제외|싫어|말고)", s):
         if len(word) >= 2:
             avoid.append(word)
+            banned_keywords.append(word)
 
+    # 2) 스타일 키워드
     for label, kws in STYLE_KEYWORDS.items():
         if any(k.lower() in s for k in kws):
             if any(h in s for h in NEGATION_HINTS):
@@ -274,6 +279,7 @@ def extract_signals_from_style_dna(style_dna: str) -> Dict[str, List[str]]:
             else:
                 prefer.append(label)
 
+    # 3) 색 키워드
     for key, kws in COLOR_KEYWORDS.items():
         hit = any(k.lower() in s for k in [x.lower() for x in kws])
         if not hit:
@@ -288,24 +294,48 @@ def extract_signals_from_style_dna(style_dna: str) -> Dict[str, List[str]]:
         "avoid_signals": list(dict.fromkeys(avoid)),
         "prefer_colors": list(dict.fromkeys(prefer_colors)),
         "avoid_colors": list(dict.fromkeys(avoid_colors)),
+        "banned_from_text": list(dict.fromkeys(banned_keywords)),
     }
 
 
-def update_style_dna_with_text(text: str, prefs: Dict) -> Dict:
-    text = (text or "").strip()
-    if not text:
-        return prefs
+def rebuild_style_profile_from_records(
+    prefs: Dict,
+    mood_records: List[Dict],
+    chat_messages: List[Dict],
+    banned_keywords_manual: List[str],
+) -> Dict:
+    """
+    ✅ 핵심: 사이드바 '무드 기록(추가/삭제 가능)' + 채팅 기록을 합쳐서
+    style_dna(누적 텍스트)와 signals를 매번 "재구성"한다.
+    삭제했을 때도 바로 반영되게 하려면 이 방식이 제일 확실함.
+    """
+    mood_texts = [str(x.get("text", "")).strip() for x in mood_records if str(x.get("text", "")).strip()]
+    chat_user_texts = [m["content"].strip() for m in chat_messages if m.get("role") == "user" and str(m.get("content", "")).strip()]
 
-    dna = prefs.get("style_dna", "")
-    dna = (dna + "\n" + text).strip() if dna else text
-    prefs["style_dna"] = dna[-1600:]
-    prefs["signals"] = extract_signals_from_style_dna(prefs["style_dna"])
+    # 최신이 뒤로 가도록 합치기
+    merged_lines = []
+    merged_lines += mood_texts
+    merged_lines += chat_user_texts
 
-    s = text.lower()
-    for word, _ in re.findall(r"([가-힣a-z0-9]+)\s*(빼|제외|싫어|말고)", s):
-        if len(word) >= 2:
-            prefs["banned_keywords"] = list(dict.fromkeys(prefs.get("banned_keywords", []) + [word]))
+    style_dna = "\n".join(merged_lines).strip()
+    style_dna = style_dna[-2000:]  # 길이 제한
 
+    signals = extract_signals_from_text(style_dna)
+
+    # 확실히 피하기(수동 입력) + 텍스트에서 잡힌 회피키워드 합치기
+    banned = []
+    banned += [x.strip() for x in banned_keywords_manual if x.strip()]
+    banned += signals.get("banned_from_text", [])
+    banned = list(dict.fromkeys(banned))
+
+    prefs["style_dna"] = style_dna
+    prefs["signals"] = {
+        "prefer_signals": signals.get("prefer_signals", []),
+        "avoid_signals": signals.get("avoid_signals", []),
+        "prefer_colors": signals.get("prefer_colors", []),
+        "avoid_colors": signals.get("avoid_colors", []),
+    }
+    prefs["banned_keywords"] = banned
     return prefs
 
 
@@ -459,9 +489,8 @@ def recommend_colors(weather: Weather, tpo_tags: List[str], prefs: Dict) -> Dict
         if any(t in tpo_tags for t in ["formal", "smart"]):
             base = "navy" if base in ("white", "green", "pink") else base
             accent = "white" if accent in ("red", "pink", "vivid") else accent
-        if "date" in tpo_tags:
-            if base in ("navy", "gray"):
-                accent = "pink"
+        if "date" in tpo_tags and base in ("navy", "gray"):
+            accent = "pink"
 
     shoe = "black" if "black" not in avoid_colors else "navy"
     bottom = "dark" if weather.rain else ("navy" if base == "white" else "gray")
@@ -517,7 +546,7 @@ def build_outfit(wardrobe: Dict, weather: Weather, tpo_tags: List[str], prefs: D
         reasons.append("비/눈 가능성이 있어 **우산/레인 대응**을 우선했어요.")
     reasons.append(f"TPO(**{', '.join(tpo_tags)}**)를 반영했어요.")
     if prefs.get("style_dna"):
-        reasons.append(f"자유 입력 무드(기록): “{prefs['style_dna'][:120]}{'…' if len(prefs['style_dna'])>120 else ''}”")
+        reasons.append(f"무드 기록+채팅 기록을 반영했어요. (요약) “{prefs['style_dna'][:120]}{'…' if len(prefs['style_dna'])>120 else ''}”")
     if prefs.get("banned_keywords"):
         reasons.append(f"피하고 싶은 키워드(**{', '.join(prefs['banned_keywords'])}**)는 제외했어요.")
     reasons.append(f"반복 방지를 위해 **다양성 강도({diversity_strength})**를 적용했어요.")
@@ -558,9 +587,8 @@ def suggest_missing_items(wardrobe: Dict, weather: Weather, tpo_tags: List[str],
         if not wardrobe_has_item_like(wardrobe, "tops", keywords=["셔츠"]):
             recs.append({"name": "기본 셔츠(화이트/라이트블루)", "why": "세미포멀에서 실패 확률이 낮아요."})
 
-    if is_minimal:
-        if not wardrobe_has_item_like(wardrobe, "bottoms", keywords=["슬랙스"]):
-            recs.append({"name": "미니멀 기본 슬랙스(다크 톤)", "why": "클린/미니멀 무드에서 활용도 최고예요."})
+    if is_minimal and not wardrobe_has_item_like(wardrobe, "bottoms", keywords=["슬랙스"]):
+        recs.append({"name": "미니멀 기본 슬랙스(다크 톤)", "why": "클린/미니멀 무드에서 활용도 최고예요."})
 
     color_plan = recommend_colors(weather, tpo_tags, prefs)
     recs.append({
@@ -578,9 +606,9 @@ def suggest_missing_items(wardrobe: Dict, weather: Weather, tpo_tags: List[str],
 # =========================
 # Streamlit App
 # =========================
-st.set_page_config(page_title="OOTD (OpenAI 키 입력)", page_icon="👕", layout="wide")
-st.title("👕 오늘의 OOTD (자유 텍스트 선호 기록 + 색 추천 + 다양성 + OpenAI 키 입력)")
-st.caption("OpenAI 키는 사이드바에서 입력/저장(세션). 지금은 호출 안 하고 다음 단계에 연결합니다.")
+st.set_page_config(page_title="OOTD (사이드바 무드 기록)", page_icon="👕", layout="wide")
+st.title("👕 오늘의 OOTD (사이드바 무드 기록 + 삭제/추가 + 채팅 반영)")
+st.caption("사이드바에서 ‘무드’를 캘린더처럼 추가/삭제 가능. 삭제하면 추천도 즉시 바뀝니다.")
 
 # Init state
 if "page" not in st.session_state:
@@ -610,19 +638,23 @@ if "messages" not in st.session_state:
 if "manual_events" not in st.session_state:
     st.session_state.manual_events = []
 
+# ✅ NEW: 사이드바 무드 기록(캘린더처럼 추가/삭제)
+if "mood_records" not in st.session_state:
+    # 각 원소: {"text": "...", "ts": "YYYY-MM-DD HH:MM"}
+    st.session_state.mood_records = []
+
 
 # -------------------------
 # Sidebar
 # -------------------------
 with st.sidebar:
     st.header("🔐 API 키")
-    # ✅ OpenAI 키 입력 칸(세션 저장)
     st.session_state.openai_api_key = st.text_input(
         "OpenAI API Key (세션 저장)",
         value=st.session_state.openai_api_key,
         type="password",
         placeholder="sk-... (앱 재시작하면 초기화됨)",
-        help="여기에 넣은 키는 st.session_state에만 저장됩니다. 다음 단계에서 OpenAI 호출에 사용합니다.",
+        help="여기에 넣은 키는 st.session_state에만 저장됩니다. 지금은 호출하지 않아요.",
     )
     if get_openai_key():
         st.success("OpenAI 키: 입력됨(세션)")
@@ -636,6 +668,39 @@ with st.sidebar:
         ["오늘 추천", "옷장 관리", "구매 추천"],
         index=["오늘 추천", "옷장 관리", "구매 추천"].index(st.session_state.page),
     )
+
+    st.divider()
+    st.subheader("🧠 무드 기록 (추가/삭제)")
+    st.caption("여기서 무드를 ‘기록’으로 남기면 채팅과 함께 추천에 반영돼요.")
+    with st.form("add_mood_record", clear_on_submit=True):
+        mood_text = st.text_input("무드 추가", placeholder="예: 도시적이고 차분한데 살짝 귀엽게 / 모노톤에 포인트")
+        add_ok = st.form_submit_button("무드 저장")
+        if add_ok:
+            if mood_text.strip():
+                st.session_state.mood_records.append({
+                    "text": mood_text.strip(),
+                    "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                })
+                st.rerun()
+            else:
+                st.warning("무드를 입력해주세요.")
+
+    if st.session_state.mood_records:
+        st.write("저장된 무드:")
+        for i, r in enumerate(st.session_state.mood_records):
+            cols = st.columns([3.2, 1.2])
+            with cols[0]:
+                st.write(f"- {r['text']}  ({r['ts']})")
+            with cols[1]:
+                if st.button("삭제", key=f"del_mood_{i}"):
+                    st.session_state.mood_records.pop(i)
+                    st.rerun()
+
+        if st.button("무드 전체 삭제"):
+            st.session_state.mood_records = []
+            st.rerun()
+    else:
+        st.info("저장된 무드가 없어요. 한 줄이라도 추가해보자!")
 
     st.divider()
     st.subheader("📅 일정(TPO) 입력 방식")
@@ -680,16 +745,17 @@ with st.sidebar:
             if ok:
                 if title.strip():
                     st.session_state.manual_events.append({"title": title.strip(), "time": time.strip()})
+                    st.rerun()
                 else:
                     st.warning("일정 제목을 입력해주세요.")
 
         if st.session_state.manual_events:
             st.write("등록된 일정(오늘):")
             for i, ev in enumerate(st.session_state.manual_events):
-                cols = st.columns([3.2, 1.2, 1.0])
+                cols = st.columns([3.2, 1.2])
                 with cols[0]:
                     st.write(f"- {ev['title']}" + (f" ({ev['time']})" if ev["time"] else ""))
-                with cols[2]:
+                with cols[1]:
                     if st.button("삭제", key=f"rm_ev_{i}"):
                         st.session_state.manual_events.pop(i)
                         st.rerun()
@@ -741,42 +807,49 @@ with st.sidebar:
             rain=(m_rain != "없음"),
             desc=(m_desc.strip() or "정보 없음"),
         )
-
     if weather_err:
         st.warning(weather_err)
 
     st.divider()
-    st.subheader("🚫 확실히 피하기")
+    st.subheader("🚫 확실히 피하기(옵션)")
     banned_text = st.text_input(
         "피하고 싶은 키워드(쉼표)",
         value=",".join(st.session_state.prefs.get("banned_keywords", [])),
+        help="여긴 ‘강제 필터’ 느낌. 무드 기록/채팅에 ‘OO 빼줘’라고 써도 자동으로 반영돼요.",
     )
-    st.session_state.prefs["banned_keywords"] = [x.strip() for x in banned_text.split(",") if x.strip()]
+    banned_keywords_manual = [x.strip() for x in banned_text.split(",") if x.strip()]
 
     st.divider()
     st.subheader("🎲 다양성(반복 방지)")
     st.session_state.prefs["diversity_strength"] = st.slider(
-        "다양성 강도",
-        0.0, 3.0,
-        float(st.session_state.prefs.get("diversity_strength", 1.5)),
-        0.1,
+        "다양성 강도", 0.0, 3.0, float(st.session_state.prefs.get("diversity_strength", 1.5)), 0.1
     )
     if st.button("추천 히스토리 초기화"):
         st.session_state.prefs["recent_picks"] = {"tops": [], "bottoms": [], "outer": [], "shoes": []}
         st.success("초기화 완료")
 
 
+# ✅ 매 실행마다: (사이드바 무드 기록 + 채팅 기록) 기반으로 style_dna/신호/금지어를 재구성
+st.session_state.prefs = rebuild_style_profile_from_records(
+    st.session_state.prefs,
+    st.session_state.mood_records,
+    st.session_state.messages,
+    banned_keywords_manual,
+)
+
+
 # =========================
-# Page: Today (chat-first fix)
+# Page: Today (채팅 입력 -> rerun -> 상단 추천 갱신)
 # =========================
 if st.session_state.page == "오늘 추천":
-    pending_text = st.chat_input("원하는 스타일/무드/색/수정사항을 자유롭게 써줘… (기록으로 남아요)")
+    pending_text = st.chat_input("채팅으로도 무드를 말해줘! (예: ‘미니멀한데 귀엽게’, ‘블랙은 빼줘’)")
+
     if pending_text:
         st.session_state.messages.append({"role": "user", "content": pending_text})
-        st.session_state.prefs = update_style_dna_with_text(pending_text, st.session_state.prefs)
-        st.session_state.messages.append({"role": "assistant", "content": "반영했어! 위쪽 추천이 새로 계산돼서 바뀔 거야."})
+        st.session_state.messages.append({"role": "assistant", "content": "반영했어! 위 추천이 다시 계산될 거야."})
         st.rerun()
 
+    # 추천 계산
     outfit, reasons, color_plan = build_outfit(st.session_state.wardrobe, weather, tpo_tags, st.session_state.prefs)
     st.session_state.prefs = update_pick_history(st.session_state.prefs, outfit)
 
@@ -826,11 +899,10 @@ if st.session_state.page == "오늘 추천":
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    with st.expander("현재 누적된 스타일/무드 기록(Style DNA)"):
+    with st.expander("현재 반영된 무드(무드 기록 + 채팅 합본)"):
         st.write(st.session_state.prefs.get("style_dna", "") or "아직 없음")
-        st.write("추출된 신호:", st.session_state.prefs.get("signals", {}))
-
-    st.info("✅ OpenAI 키를 넣어두면, 다음 단계에서 이 기록(Style DNA) + 날씨 + TPO를 기반으로 LLM 추천을 바로 붙일 수 있어요.")
+        st.write("추출 신호:", st.session_state.prefs.get("signals", {}))
+        st.write("금지 키워드:", st.session_state.prefs.get("banned_keywords", []))
 
 
 # =========================
@@ -846,7 +918,7 @@ elif st.session_state.page == "옷장 관리":
     with st.form("add_item_form", clear_on_submit=True):
         category = st.selectbox("카테고리", ["tops", "bottoms", "outer", "shoes", "extras"])
         name = st.text_input("이름", placeholder="예: 그레이 후드티")
-        tags_text = st.text_input("태그(쉼표)", placeholder="예: casual,street,cozy,clean,minimal")
+        tags_text = st.text_input("태그(쉼표)", placeholder="예: casual,street,cozy,clean,minimal,black")
         warmth = st.slider("보온도(warmth) (의류만)", 0.0, 7.0, 3.0, step=0.5)
         rain_ok = st.checkbox("비/눈 OK (아우터/신발에 권장)", value=False)
         submitted = st.form_submit_button("추가")
@@ -919,22 +991,22 @@ elif st.session_state.page == "옷장 관리":
 # =========================
 elif st.session_state.page == "구매 추천":
     st.subheader("사면 좋은(없는) 옷 추천")
-    st.caption("내 옷장 + 오늘 날씨 + TPO + (추가 무드 입력)으로 ‘없으면’ 도움 되는 아이템을 추천해요.")
+    st.caption("내 옷장 + 오늘 날씨 + TPO + (무드 기록/채팅)을 보고 ‘없으면’ 도움 되는 아이템을 추천해요.")
 
-    st.markdown("### ✍️ 구매 추천용 무드/스타일 추가 입력(선택)")
-    mood_extra = st.text_area(
-        "예) ‘코지하지만 단정하게’, ‘모노톤에 포인트 하나’, ‘빈티지 무드인데 과하지 않게’",
-        value="",
-        height=90,
-        placeholder="여기에 적고 아래 버튼을 누르면 Style DNA 기록에 추가됩니다.",
-    )
-    if st.button("무드 추가 반영"):
-        if mood_extra.strip():
-            st.session_state.prefs = update_style_dna_with_text(mood_extra.strip(), st.session_state.prefs)
-            st.success("반영 완료! 추천이 업데이트됩니다.")
-            st.rerun()
-        else:
-            st.info("입력한 내용이 없어요.")
+    st.markdown("### ✍️ 구매 추천용 무드 추가(선택)")
+    st.caption("※ 이 입력은 사이드바 ‘무드 기록’에 저장되며, 삭제도 가능합니다.")
+    with st.form("add_mood_from_buy", clear_on_submit=True):
+        mood_extra = st.text_input("무드 한 줄 추가", placeholder="예: 모노톤인데 따뜻한 느낌 / 빈티지 but 깔끔")
+        ok = st.form_submit_button("무드 기록에 추가")
+        if ok:
+            if mood_extra.strip():
+                st.session_state.mood_records.append({
+                    "text": mood_extra.strip(),
+                    "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                })
+                st.rerun()
+            else:
+                st.info("입력한 내용이 없어요.")
 
     missing = suggest_missing_items(st.session_state.wardrobe, weather, tpo_tags, st.session_state.prefs)
 
@@ -953,20 +1025,17 @@ elif st.session_state.page == "구매 추천":
                 st.write(f"- 추천 이유: {r['why']}")
 
     st.divider()
-    st.subheader("현재 누적된 스타일/무드 기록(Style DNA)")
-    dna = st.session_state.prefs.get("style_dna", "")
-    st.write(dna[:700] + ("…" if len(dna) > 700 else "") if dna else "아직 없음")
-    st.write("추출된 신호:", st.session_state.prefs.get("signals", {}))
-
-    if get_openai_key():
-        st.success("OpenAI 키가 입력되어 있어요. 다음 단계에서 구매 추천을 LLM으로 고도화할 수 있어요.")
-    else:
-        st.info("OpenAI 키를 넣어두면 다음 단계에서 LLM 추천을 쉽게 붙일 수 있어요.")
+    st.subheader("현재 반영된 무드(무드 기록 + 채팅 합본)")
+    st.write(st.session_state.prefs.get("style_dna", "") or "아직 없음")
+    st.write("추출 신호:", st.session_state.prefs.get("signals", {}))
+    st.write("금지 키워드:", st.session_state.prefs.get("banned_keywords", []))
 
 
 with st.expander("🔎 디버그"):
     st.write("page:", st.session_state.page)
     st.write("openai_key_present:", bool(get_openai_key()))
+    st.write("mood_records:", st.session_state.mood_records)
+    st.write("messages:", st.session_state.messages)
     st.write("prefs:", st.session_state.prefs)
     st.write("tpo_tags:", tpo_tags)
     st.write("wardrobe:", st.session_state.wardrobe)
