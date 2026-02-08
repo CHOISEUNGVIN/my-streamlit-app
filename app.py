@@ -8,14 +8,12 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-
-# openai는 설치만(다음 단계 연동용). 지금 코드는 호출하지 않음.
-from openai import OpenAI  # noqa: F401
+from openai import OpenAI  # 설치만(다음 단계 연동용). 지금 코드는 호출하지 않음.  # noqa: F401
 
 
-# =========================
-# Data models
-# =========================
+# =========================================================
+# Models
+# =========================================================
 @dataclass
 class Weather:
     city: str
@@ -34,9 +32,9 @@ class EventTPO:
     tags: List[str]
 
 
-# =========================
-# Secrets / env helpers
-# =========================
+# =========================================================
+# Secrets helpers (optional)
+# =========================================================
 def get_secret(key: str, default: str = "") -> str:
     try:
         return str(st.secrets.get(key, default))
@@ -53,23 +51,23 @@ def get_openweather_key() -> str:
 
 
 def get_openai_key() -> str:
-    # 사용자가 사이드바에서 입력한 키 우선, 없으면 secrets/env
-    if st.session_state.get("openai_api_key"):
-        return str(st.session_state.openai_api_key).strip()
+    # 사이드바 입력(세션)이 최우선
+    k = str(st.session_state.get("openai_api_key", "") or "").strip()
+    if k:
+        return k
     return get_secret("OPENAI_API_KEY", "")
 
 
-# =========================
-# Weather (OpenWeather via stdlib)
-# =========================
+# =========================================================
+# Weather via stdlib (OpenWeather optional)
+# =========================================================
 def fetch_openweather(city: str, api_key: str) -> Tuple[bool, Dict]:
     if not api_key:
-        return False, {"error": "OPENWEATHER_API_KEY가 없어 수동 날씨 입력만 가능합니다."}
+        return False, {"error": "OPENWEATHER_API_KEY가 없어 수동 입력만 가능합니다."}
     try:
         base = "https://api.openweathermap.org/data/2.5/weather"
         qs = urllib.parse.urlencode({"q": city, "appid": api_key, "units": "metric", "lang": "kr"})
         url = f"{base}?{qs}"
-
         with urllib.request.urlopen(url, timeout=10) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
         data = json.loads(raw)
@@ -98,7 +96,7 @@ def fetch_openweather(city: str, api_key: str) -> Tuple[bool, Dict]:
             )
         }
     except Exception as e:
-        return False, {"error": f"날씨 자동 조회 실패: {e}"}
+        return False, {"error": f"날씨 조회 실패: {e}"}
 
 
 def temp_band(feels_c: float) -> str:
@@ -115,9 +113,9 @@ def temp_band(feels_c: float) -> str:
     return "매우 더움"
 
 
-# =========================
-# Calendar (ICS) - stdlib parsing
-# =========================
+# =========================================================
+# Calendar (ICS) minimal parser
+# =========================================================
 def fetch_ics_from_url(url: str) -> Tuple[bool, bytes]:
     try:
         with urllib.request.urlopen(url, timeout=12) as resp:
@@ -182,33 +180,38 @@ def parse_ics_minimal(ics_bytes: bytes, target_date: dt.date) -> List[EventTPO]:
     return events
 
 
-# =========================
-# Wardrobe defaults & storage
-# =========================
+# =========================================================
+# Wardrobe
+# =========================================================
 def default_wardrobe() -> Dict:
     return {
         "tops": [
             {"name": "화이트 셔츠", "tags": ["formal", "smart", "neutral", "clean"], "warmth": 2},
             {"name": "맨투맨", "tags": ["casual", "cozy"], "warmth": 3},
             {"name": "블랙 니트", "tags": ["smart", "casual", "black", "minimal"], "warmth": 4},
+            {"name": "라이트 블루 셔츠", "tags": ["formal", "smart", "clean"], "warmth": 2},
         ],
         "bottoms": [
             {"name": "청바지", "tags": ["casual"], "warmth": 2},
             {"name": "슬랙스", "tags": ["formal", "smart", "clean"], "warmth": 2},
+            {"name": "블랙 팬츠", "tags": ["minimal", "black", "smart"], "warmth": 2},
             {"name": "조거팬츠", "tags": ["sport", "casual", "cozy"], "warmth": 2},
         ],
         "outer": [
             {"name": "자켓(블레이저)", "tags": ["formal", "smart", "clean"], "warmth": 3},
             {"name": "바람막이", "tags": ["outdoor", "sport", "casual"], "warmth": 2, "rain_ok": True},
             {"name": "패딩", "tags": ["casual", "cozy"], "warmth": 6, "rain_ok": True},
+            {"name": "트렌치코트", "tags": ["smart", "clean"], "warmth": 4, "rain_ok": False},
         ],
         "shoes": [
             {"name": "스니커즈", "tags": ["casual", "street", "sport"], "rain_ok": True},
             {"name": "로퍼", "tags": ["formal", "smart", "clean"], "rain_ok": False},
+            {"name": "부츠", "tags": ["smart", "casual"], "rain_ok": True},
         ],
         "extras": [
             {"name": "우산", "tags": ["rain"]},
             {"name": "머플러", "tags": ["cold", "cozy"]},
+            {"name": "캡모자", "tags": ["casual", "street"]},
         ],
     }
 
@@ -223,9 +226,12 @@ def normalize_wardrobe(w: Dict) -> Dict:
     return w
 
 
-# =========================
-# Free-text mood/style extraction
-# =========================
+# =========================================================
+# Mood & Preference system (sidebar records + chat records)
+# - "반영이 안됨" 해결 포인트:
+#   1) 무드/채팅 입력을 profile로 재구성(rebuild)
+#   2) "다르게/바꿔/새로" 요청 시, 직전 추천 아이템을 강제로 제외(temp ban)
+# =========================================================
 STYLE_KEYWORDS = {
     "미니멀": ["minimal", "미니멀", "깔끔", "심플", "정갈"],
     "클린": ["clean", "클린", "단정", "정돈"],
@@ -255,127 +261,95 @@ COLOR_KEYWORDS = {
     "neutral": ["뉴트럴", "무채색", "neutral", "모노톤", "모노"],
 }
 
-NEGATION_HINTS = ["빼", "제외", "싫", "말고", "no ", "not "]
+REASK_TRIGGERS = ["바꿔", "다시", "새로", "다른", "재추천", "다르게", "change", "reroll"]
 
 
-def extract_signals_from_text(bundle_text: str) -> Dict[str, List[str]]:
+def extract_signals(bundle_text: str) -> Dict[str, List[str]]:
     s = (bundle_text or "").lower()
-
     prefer, avoid = [], []
     prefer_colors, avoid_colors = [], []
-    banned_keywords = []
+    banned_words = []
 
-    # 1) "OO 빼줘/제외/싫/말고" -> 강한 회피 신호
+    # "OO 빼줘/제외/싫어/말고"
     for word, _ in re.findall(r"([가-힣a-z0-9]+)\s*(빼|제외|싫어|말고)", s):
         if len(word) >= 2:
             avoid.append(word)
-            banned_keywords.append(word)
+            banned_words.append(word)
 
-    # 2) 스타일 키워드
     for label, kws in STYLE_KEYWORDS.items():
         if any(k.lower() in s for k in kws):
-            if any(h in s for h in NEGATION_HINTS):
-                avoid.append(label)
-            else:
-                prefer.append(label)
+            prefer.append(label)
 
-    # 3) 색 키워드
     for key, kws in COLOR_KEYWORDS.items():
         hit = any(k.lower() in s for k in [x.lower() for x in kws])
-        if not hit:
-            continue
-        if any(h in s for h in ["빼", "제외", "싫", "말고"]):
-            avoid_colors.append(key)
-        else:
-            prefer_colors.append(key)
+        if hit:
+            # 단순: 문장에 "빼/싫"이 같이 있으면 avoid_colors로
+            if any(x in s for x in ["빼", "제외", "싫", "말고"]):
+                avoid_colors.append(key)
+            else:
+                prefer_colors.append(key)
 
     return {
         "prefer_signals": list(dict.fromkeys(prefer)),
         "avoid_signals": list(dict.fromkeys(avoid)),
         "prefer_colors": list(dict.fromkeys(prefer_colors)),
         "avoid_colors": list(dict.fromkeys(avoid_colors)),
-        "banned_from_text": list(dict.fromkeys(banned_keywords)),
+        "banned_from_text": list(dict.fromkeys(banned_words)),
     }
 
 
-def rebuild_style_profile_from_records(
+def rebuild_profile(
     prefs: Dict,
     mood_records: List[Dict],
     chat_messages: List[Dict],
-    banned_keywords_manual: List[str],
+    banned_manual: List[str],
 ) -> Dict:
-    """
-    ✅ 핵심: 사이드바 '무드 기록(추가/삭제 가능)' + 채팅 기록을 합쳐서
-    style_dna(누적 텍스트)와 signals를 매번 "재구성"한다.
-    삭제했을 때도 바로 반영되게 하려면 이 방식이 제일 확실함.
-    """
     mood_texts = [str(x.get("text", "")).strip() for x in mood_records if str(x.get("text", "")).strip()]
     chat_user_texts = [m["content"].strip() for m in chat_messages if m.get("role") == "user" and str(m.get("content", "")).strip()]
+    style_dna = "\n".join(mood_texts + chat_user_texts).strip()[-2500:]
 
-    # 최신이 뒤로 가도록 합치기
-    merged_lines = []
-    merged_lines += mood_texts
-    merged_lines += chat_user_texts
+    sig = extract_signals(style_dna)
 
-    style_dna = "\n".join(merged_lines).strip()
-    style_dna = style_dna[-2000:]  # 길이 제한
-
-    signals = extract_signals_from_text(style_dna)
-
-    # 확실히 피하기(수동 입력) + 텍스트에서 잡힌 회피키워드 합치기
     banned = []
-    banned += [x.strip() for x in banned_keywords_manual if x.strip()]
-    banned += signals.get("banned_from_text", [])
+    banned += [x.strip() for x in banned_manual if x.strip()]
+    banned += sig.get("banned_from_text", [])
     banned = list(dict.fromkeys(banned))
 
     prefs["style_dna"] = style_dna
     prefs["signals"] = {
-        "prefer_signals": signals.get("prefer_signals", []),
-        "avoid_signals": signals.get("avoid_signals", []),
-        "prefer_colors": signals.get("prefer_colors", []),
-        "avoid_colors": signals.get("avoid_colors", []),
+        "prefer_signals": sig.get("prefer_signals", []),
+        "avoid_signals": sig.get("avoid_signals", []),
+        "prefer_colors": sig.get("prefer_colors", []),
+        "avoid_colors": sig.get("avoid_colors", []),
     }
     prefs["banned_keywords"] = banned
     return prefs
 
 
-# =========================
-# Outfit engine + Diversity + Color recommendation
-# =========================
-def ideal_warmth(feels_c: float, warmth_bias: float = 0.0) -> float:
+# =========================================================
+# Outfit engine (with guaranteed reroll via temp ban)
+# =========================================================
+def ideal_warmth(feels_c: float, bias: float = 0.0) -> float:
     band = temp_band(feels_c)
-    base = {
-        "매우 추움": 6,
-        "추움": 5,
-        "쌀쌀": 3.5,
-        "적당": 2.5,
-        "더움": 1.5,
-        "매우 더움": 0.5,
-    }[band]
-    return max(0.0, base + warmth_bias)
-
-
-def apply_diversity_penalty(item_name: str, recent: List[str], strength: float) -> float:
-    if not item_name:
-        return 0.0
-    if item_name in recent:
-        idx = recent.index(item_name)
-        return -(strength * (1.0 - (idx / max(1, len(recent)))))
-    return 0.0
+    base = {"매우 추움": 6, "추움": 5, "쌀쌀": 3.5, "적당": 2.5, "더움": 1.5, "매우 더움": 0.5}[band]
+    return max(0.0, base + bias)
 
 
 def score_item(item: Dict, wanted_tags: List[str], prefs: Dict, weather: Weather, category: str) -> float:
-    score = 0.0
     name = str(item.get("name", "")).lower()
     tags = item.get("tags", [])
     warmth = float(item.get("warmth", 0.0))
+    score = 0.0
 
+    # TPO
     for t in wanted_tags:
         if t in tags:
             score += 2.0
 
-    signals = prefs.get("signals", {})
-    for p in signals.get("prefer_signals", []):
+    # mood/style signals
+    sig = prefs.get("signals", {})
+    for p in sig.get("prefer_signals", []):
+        # label -> tag guess
         tag_guess = {
             "미니멀": "minimal",
             "클린": "clean",
@@ -388,94 +362,50 @@ def score_item(item: Dict, wanted_tags: List[str], prefs: Dict, weather: Weather
             "아방가르드": "avant",
         }.get(p, "")
         if tag_guess and tag_guess in tags:
-            score += 1.2
+            score += 1.0
         if p.lower() in name:
-            score += 0.5
+            score += 0.3
 
-    for a in signals.get("avoid_signals", []):
-        if a.lower() in name:
-            score -= 2.0
-
+    # rain
     if weather.rain:
         if item.get("rain_ok", False) or category not in ("outer", "shoes"):
-            score += 0.6
+            score += 0.5
         else:
             score -= 1.0
 
+    # warmth closeness
     if category in ("tops", "bottoms", "outer"):
-        ideal = ideal_warmth(weather.feels_c, prefs.get("warmth_bias", 0.0))
-        score += max(0.0, 2.5 - abs(warmth - ideal))
+        target = ideal_warmth(weather.feels_c, prefs.get("warmth_bias", 0.0))
+        score += max(0.0, 2.2 - abs(warmth - target))
 
+    # banned keywords
     for b in prefs.get("banned_keywords", []):
         if b.lower() in name:
-            score -= 6.0
+            score -= 7.0
+
+    # ✅ GUARANTEED CHANGE: temp banned items (reroll)
+    temp_ban = set(st.session_state.get("temp_ban_items", []))
+    if str(item.get("name", "")) in temp_ban:
+        score -= 999.0
 
     return score
 
 
-def rank_items(items: List[Dict], wanted_tags: List[str], prefs: Dict, weather: Weather, category: str) -> List[Tuple[float, Dict]]:
-    ranked = [(score_item(it, wanted_tags, prefs, weather, category), it) for it in items]
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked
-
-
-def pick_with_diversity(
-    items: List[Dict],
-    wanted_tags: List[str],
-    prefs: Dict,
-    weather: Weather,
-    category: str,
-    recent_items: List[str],
-    strength: float,
-) -> Optional[Dict]:
+def pick_best(items: List[Dict], wanted_tags: List[str], prefs: Dict, weather: Weather, category: str) -> Optional[Dict]:
     if not items:
         return None
-    ranked = rank_items(items, wanted_tags, prefs, weather, category)
-
-    best_score, best_item = None, None
-    for base_score, it in ranked[:8]:
-        nm = str(it.get("name", ""))
-        score = base_score + apply_diversity_penalty(nm, recent_items, strength)
-        if best_score is None or score > best_score:
-            best_score, best_item = score, it
-    return best_item or ranked[0][1]
-
-
-def update_pick_history(prefs: Dict, outfit: Dict, max_len: int = 10) -> Dict:
-    if "recent_picks" not in prefs or not isinstance(prefs["recent_picks"], dict):
-        prefs["recent_picks"] = {"tops": [], "bottoms": [], "outer": [], "shoes": []}
-
-    def push(cat: str, item: Optional[Dict]):
-        if not item:
-            return
-        name = str(item.get("name", ""))
-        if not name:
-            return
-        lst = prefs["recent_picks"].get(cat, [])
-        if name in lst:
-            lst.remove(name)
-        lst.insert(0, name)
-        prefs["recent_picks"][cat] = lst[:max_len]
-
-    push("tops", outfit.get("top"))
-    push("bottoms", outfit.get("bottom"))
-    push("outer", outfit.get("outer"))
-    push("shoes", outfit.get("shoes"))
-    return prefs
+    ranked = [(score_item(it, wanted_tags, prefs, weather, category), it) for it in items]
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked[0][1]
 
 
 def recommend_colors(weather: Weather, tpo_tags: List[str], prefs: Dict) -> Dict[str, str]:
-    signals = prefs.get("signals", {})
-    prefer_colors = signals.get("prefer_colors", [])
-    avoid_colors = set(signals.get("avoid_colors", []))
+    sig = prefs.get("signals", {})
+    prefer = [c for c in sig.get("prefer_colors", []) if c not in set(sig.get("avoid_colors", []))]
 
-    if prefer_colors:
-        filtered = [c for c in prefer_colors if c not in avoid_colors]
-        if filtered:
-            base = filtered[0]
-            accent = filtered[1] if len(filtered) > 1 else "neutral"
-        else:
-            base, accent = "neutral", "navy"
+    if prefer:
+        base = prefer[0]
+        accent = prefer[1] if len(prefer) > 1 else "neutral"
     else:
         if weather.feels_c <= 8:
             base, accent = "navy", "beige"
@@ -492,14 +422,13 @@ def recommend_colors(weather: Weather, tpo_tags: List[str], prefs: Dict) -> Dict
         if "date" in tpo_tags and base in ("navy", "gray"):
             accent = "pink"
 
-    shoe = "black" if "black" not in avoid_colors else "navy"
+    shoe = "black" if "black" not in set(sig.get("avoid_colors", [])) else "navy"
     bottom = "dark" if weather.rain else ("navy" if base == "white" else "gray")
-
     return {"base": base, "accent": accent, "bottom_hint": bottom, "shoe_hint": shoe}
 
 
 def pretty_color_name(c: str) -> str:
-    mapping = {
+    m = {
         "black": "블랙",
         "white": "화이트",
         "gray": "그레이",
@@ -516,86 +445,81 @@ def pretty_color_name(c: str) -> str:
         "neutral": "뉴트럴(무채색)",
         "dark": "어두운 톤",
     }
-    return mapping.get(c, c)
+    return m.get(c, c)
 
 
 def build_outfit(wardrobe: Dict, weather: Weather, tpo_tags: List[str], prefs: Dict) -> Tuple[Dict, List[str], Dict[str, str]]:
     wanted = list(dict.fromkeys(tpo_tags))
-    diversity_strength = float(prefs.get("diversity_strength", 1.5))
 
-    history = prefs.get("recent_picks", {})
-    top = pick_with_diversity(wardrobe["tops"], wanted, prefs, weather, "tops", history.get("tops", []), diversity_strength)
-    bottom = pick_with_diversity(wardrobe["bottoms"], wanted, prefs, weather, "bottoms", history.get("bottoms", []), diversity_strength)
-    shoes = pick_with_diversity(wardrobe["shoes"], wanted, prefs, weather, "shoes", history.get("shoes", []), diversity_strength)
+    top = pick_best(wardrobe["tops"], wanted, prefs, weather, "tops")
+    bottom = pick_best(wardrobe["bottoms"], wanted, prefs, weather, "bottoms")
+    shoes = pick_best(wardrobe["shoes"], wanted, prefs, weather, "shoes")
 
     need_outer = weather.feels_c <= 16 or weather.rain or weather.wind_ms >= 7
-    outer = pick_with_diversity(wardrobe["outer"], wanted, prefs, weather, "outer", history.get("outer", []), diversity_strength) if need_outer else None
+    outer = pick_best(wardrobe["outer"], wanted, prefs, weather, "outer") if need_outer else None
 
     extras = []
     if weather.rain:
-        extras.append({"name": "우산"})
+        extras.append("우산")
     if weather.feels_c <= 8:
-        extras.append({"name": "머플러"})
+        extras.append("머플러")
 
     outfit = {"top": top, "bottom": bottom, "outer": outer, "shoes": shoes, "extras": extras}
     color_plan = recommend_colors(weather, tpo_tags, prefs)
 
     reasons = []
-    reasons.append(f"체감온도 **{weather.feels_c:.1f}℃({temp_band(weather.feels_c)})** 기준으로 레이어링/보온을 맞췄어요.")
+    reasons.append(f"체감온도 **{weather.feels_c:.1f}℃({temp_band(weather.feels_c)})** 기준으로 구성했어요.")
     if weather.rain:
-        reasons.append("비/눈 가능성이 있어 **우산/레인 대응**을 우선했어요.")
+        reasons.append("비/눈 가능성이 있어 레인 대응(아우터/신발/우산)을 고려했어요.")
     reasons.append(f"TPO(**{', '.join(tpo_tags)}**)를 반영했어요.")
     if prefs.get("style_dna"):
-        reasons.append(f"무드 기록+채팅 기록을 반영했어요. (요약) “{prefs['style_dna'][:120]}{'…' if len(prefs['style_dna'])>120 else ''}”")
+        reasons.append(f"무드 기록/채팅을 합쳐 반영했어요: “{prefs['style_dna'][:120]}{'…' if len(prefs['style_dna'])>120 else ''}”")
     if prefs.get("banned_keywords"):
         reasons.append(f"피하고 싶은 키워드(**{', '.join(prefs['banned_keywords'])}**)는 제외했어요.")
-    reasons.append(f"반복 방지를 위해 **다양성 강도({diversity_strength})**를 적용했어요.")
-    reasons.append(f"추천 컬러: **{pretty_color_name(color_plan['base'])} 베이스 + {pretty_color_name(color_plan['accent'])} 포인트**")
+    reasons.append(f"컬러는 **{pretty_color_name(color_plan['base'])} 베이스 + {pretty_color_name(color_plan['accent'])} 포인트**를 추천해요.")
 
     return outfit, reasons, color_plan
 
 
-# =========================
-# Shopping recommendations (+ mood input)
-# =========================
+# =========================================================
+# Purchase suggestions (simple)
+# =========================================================
 def wardrobe_has_item_like(wardrobe: Dict, category: str, keywords: List[str] = None) -> bool:
     keywords = keywords or []
     for it in wardrobe.get(category, []):
-        name = str(it.get("name", "")).lower()
-        if any(k.lower() in name for k in keywords):
+        n = str(it.get("name", "")).lower()
+        if any(k.lower() in n for k in keywords):
             return True
     return False
 
 
 def suggest_missing_items(wardrobe: Dict, weather: Weather, tpo_tags: List[str], prefs: Dict) -> List[Dict]:
-    recs: List[Dict] = []
-    signals = prefs.get("signals", {})
-    is_minimal = any(x in signals.get("prefer_signals", []) for x in ["미니멀", "클린"])
+    recs = []
+    sig = prefs.get("signals", {})
+    is_clean = any(x in sig.get("prefer_signals", []) for x in ["미니멀", "클린"])
 
     if weather.rain:
-        if not wardrobe_has_item_like(wardrobe, "outer", keywords=["방수", "레인", "우비"]):
-            recs.append({"name": "방수 바람막이/레인 재킷", "why": "비 오는 날 ‘편함’ 체감이 커요."})
-        if not wardrobe_has_item_like(wardrobe, "shoes", keywords=["방수", "레인", "부츠"]):
-            recs.append({"name": "방수 신발(레인부츠/방수 스니커즈)", "why": "젖는 스트레스를 확 줄여줘요."})
+        if not wardrobe_has_item_like(wardrobe, "outer", ["방수", "레인", "우비"]):
+            recs.append({"name": "방수 바람막이/레인 재킷", "why": "비 오는 날 체감 편의성이 커요."})
+        if not wardrobe_has_item_like(wardrobe, "shoes", ["방수", "레인", "부츠"]):
+            recs.append({"name": "방수 신발(레인부츠/방수 스니커즈)", "why": "젖는 스트레스를 줄여줘요."})
 
-    if weather.feels_c <= 8 and not wardrobe_has_item_like(wardrobe, "outer", keywords=["패딩", "코트"]):
-        recs.append({"name": "따뜻한 아우터(패딩/롱코트)", "why": "추운 날 코디 고민을 크게 줄여줘요."})
+    if weather.feels_c <= 8 and not wardrobe_has_item_like(wardrobe, "outer", ["코트", "패딩"]):
+        recs.append({"name": "따뜻한 아우터(코트/패딩)", "why": "추운 날 코디 고민을 크게 줄여줘요."})
 
     if any(t in tpo_tags for t in ["formal", "smart"]):
-        if not wardrobe_has_item_like(wardrobe, "outer", keywords=["블레이저", "자켓"]):
-            recs.append({"name": "기본 블레이저", "why": "발표/미팅/면접의 전천후 아이템이에요."})
-        if not wardrobe_has_item_like(wardrobe, "tops", keywords=["셔츠"]):
-            recs.append({"name": "기본 셔츠(화이트/라이트블루)", "why": "세미포멀에서 실패 확률이 낮아요."})
+        if not wardrobe_has_item_like(wardrobe, "outer", ["블레이저", "자켓"]):
+            recs.append({"name": "기본 블레이저", "why": "미팅/발표/면접에서 실패 확률이 낮아요."})
+        if not wardrobe_has_item_like(wardrobe, "tops", ["셔츠"]):
+            recs.append({"name": "기본 셔츠(화이트/라이트블루)", "why": "세미포멀/클린 무드에 강해요."})
 
-    if is_minimal and not wardrobe_has_item_like(wardrobe, "bottoms", keywords=["슬랙스"]):
-        recs.append({"name": "미니멀 기본 슬랙스(다크 톤)", "why": "클린/미니멀 무드에서 활용도 최고예요."})
+    if is_clean and not wardrobe_has_item_like(wardrobe, "bottoms", ["슬랙스"]):
+        recs.append({"name": "다크 톤 슬랙스", "why": "클린/미니멀 무드에서 조합이 쉬워요."})
 
-    color_plan = recommend_colors(weather, tpo_tags, prefs)
-    recs.append({
-        "name": f"컬러 방향: {pretty_color_name(color_plan['base'])} 베이스 + {pretty_color_name(color_plan['accent'])} 포인트",
-        "why": "오늘 조건(날씨/TPO/무드)에서 실패 확률이 낮은 팔레트예요.",
-    })
+    cp = recommend_colors(weather, tpo_tags, prefs)
+    recs.append({"name": f"컬러 방향: {pretty_color_name(cp['base'])} + {pretty_color_name(cp['accent'])}", "why": "오늘 조건에서 안정적인 팔레트예요."})
 
+    # dedupe
     seen, out = set(), []
     for r in recs:
         if r["name"] not in seen:
@@ -603,14 +527,16 @@ def suggest_missing_items(wardrobe: Dict, weather: Weather, tpo_tags: List[str],
     return out
 
 
-# =========================
-# Streamlit App
-# =========================
-st.set_page_config(page_title="OOTD (사이드바 무드 기록)", page_icon="👕", layout="wide")
-st.title("👕 오늘의 OOTD (사이드바 무드 기록 + 삭제/추가 + 채팅 반영)")
-st.caption("사이드바에서 ‘무드’를 캘린더처럼 추가/삭제 가능. 삭제하면 추천도 즉시 바뀝니다.")
+# =========================================================
+# Streamlit UI
+# =========================================================
+st.set_page_config(page_title="OOTD (처음부터: 반영 보장)", page_icon="👕", layout="wide")
+st.title("👕 OOTD 추천 (무드 기록 + 채팅 반영 ‘확실히’ + 캘린더 선택 연동)")
+st.caption("핵심: ‘다르게 해줘/바꿔줘’라고 말하면 직전 추천 아이템을 강제로 제외해서 **반드시** 옷이 바뀌게 했어요.")
 
-# Init state
+# ---------------------
+# Session init
+# ---------------------
 if "page" not in st.session_state:
     st.session_state.page = "오늘 추천"
 
@@ -621,99 +547,97 @@ if "wardrobe" not in st.session_state:
     st.session_state.wardrobe = default_wardrobe()
 st.session_state.wardrobe = normalize_wardrobe(st.session_state.wardrobe)
 
-if "prefs" not in st.session_state:
-    st.session_state.prefs = {
-        "banned_keywords": [],
-        "avoid_shoes": [],
-        "warmth_bias": 0.0,
-        "style_dna": "",
-        "signals": {"prefer_signals": [], "avoid_signals": [], "prefer_colors": [], "avoid_colors": []},
-        "diversity_strength": 1.5,
-        "recent_picks": {"tops": [], "bottoms": [], "outer": [], "shoes": []},
-    }
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if "mood_records" not in st.session_state:
+    st.session_state.mood_records = []  # [{"text":..., "ts":...}]
 
 if "manual_events" not in st.session_state:
     st.session_state.manual_events = []
 
-# ✅ NEW: 사이드바 무드 기록(캘린더처럼 추가/삭제)
-if "mood_records" not in st.session_state:
-    # 각 원소: {"text": "...", "ts": "YYYY-MM-DD HH:MM"}
-    st.session_state.mood_records = []
+if "prefs" not in st.session_state:
+    st.session_state.prefs = {
+        "warmth_bias": 0.0,
+        "style_dna": "",
+        "signals": {"prefer_signals": [], "avoid_signals": [], "prefer_colors": [], "avoid_colors": []},
+        "banned_keywords": [],
+    }
 
+# ✅ 반영 보장용 상태
+if "temp_ban_items" not in st.session_state:
+    st.session_state.temp_ban_items = []
 
-# -------------------------
+if "last_outfit" not in st.session_state:
+    st.session_state.last_outfit = {"top": None, "bottom": None, "outer": None, "shoes": None}
+
+# ---------------------
 # Sidebar
-# -------------------------
+# ---------------------
 with st.sidebar:
     st.header("🔐 API 키")
     st.session_state.openai_api_key = st.text_input(
         "OpenAI API Key (세션 저장)",
         value=st.session_state.openai_api_key,
         type="password",
-        placeholder="sk-... (앱 재시작하면 초기화됨)",
-        help="여기에 넣은 키는 st.session_state에만 저장됩니다. 지금은 호출하지 않아요.",
+        placeholder="sk-...",
+        help="지금은 호출하지 않지만 다음 단계에 LLM 추천 연결할 때 씁니다.",
     )
     if get_openai_key():
         st.success("OpenAI 키: 입력됨(세션)")
     else:
-        st.info("OpenAI 키: 아직 없음")
+        st.info("OpenAI 키: 없음")
 
     st.divider()
     st.header("메뉴")
-    st.session_state.page = st.radio(
-        "이동",
-        ["오늘 추천", "옷장 관리", "구매 추천"],
-        index=["오늘 추천", "옷장 관리", "구매 추천"].index(st.session_state.page),
-    )
+    st.session_state.page = st.radio("이동", ["오늘 추천", "옷장 관리", "구매 추천"],
+                                     index=["오늘 추천", "옷장 관리", "구매 추천"].index(st.session_state.page))
 
     st.divider()
-    st.subheader("🧠 무드 기록 (추가/삭제)")
-    st.caption("여기서 무드를 ‘기록’으로 남기면 채팅과 함께 추천에 반영돼요.")
+    st.subheader("🧠 무드 기록(추가/삭제)")
+    st.caption("사이드바에서 무드를 ‘기록’으로 남겨요. 삭제하면 즉시 반영됩니다.")
     with st.form("add_mood_record", clear_on_submit=True):
-        mood_text = st.text_input("무드 추가", placeholder="예: 도시적이고 차분한데 살짝 귀엽게 / 모노톤에 포인트")
-        add_ok = st.form_submit_button("무드 저장")
-        if add_ok:
+        mood_text = st.text_input("무드 한 줄", placeholder="예: 차분한데 포근하게 / 모노톤+포인트 / 귀엽지만 과하지 않게")
+        ok = st.form_submit_button("무드 저장")
+        if ok:
             if mood_text.strip():
-                st.session_state.mood_records.append({
-                    "text": mood_text.strip(),
-                    "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
+                st.session_state.mood_records.append({"text": mood_text.strip(), "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
                 st.rerun()
             else:
                 st.warning("무드를 입력해주세요.")
 
     if st.session_state.mood_records:
-        st.write("저장된 무드:")
         for i, r in enumerate(st.session_state.mood_records):
-            cols = st.columns([3.2, 1.2])
+            cols = st.columns([3.1, 1.0])
             with cols[0]:
                 st.write(f"- {r['text']}  ({r['ts']})")
             with cols[1]:
                 if st.button("삭제", key=f"del_mood_{i}"):
                     st.session_state.mood_records.pop(i)
                     st.rerun()
-
         if st.button("무드 전체 삭제"):
             st.session_state.mood_records = []
             st.rerun()
     else:
-        st.info("저장된 무드가 없어요. 한 줄이라도 추가해보자!")
+        st.info("무드 기록이 없어요.")
 
     st.divider()
-    st.subheader("📅 일정(TPO) 입력 방식")
+    st.subheader("🚫 확실히 피하기(강제)")
+    banned_text = st.text_input("금지 키워드(쉼표)", value=",".join(st.session_state.prefs.get("banned_keywords", [])))
+    banned_manual = [x.strip() for x in banned_text.split(",") if x.strip()]
+
+    st.divider()
+    st.subheader("📅 일정(TPO)")
     target_date = st.date_input("추천 날짜", value=dt.date.today())
-    tpo_mode = st.radio("일정 가져오기", ["캘린더 연동(선택)", "앱에서 직접 입력"], index=0)
+    tpo_mode = st.radio("일정 입력", ["캘린더 연동(선택)", "앱에서 직접 입력"], index=0)
 
     tpo_tags: List[str] = ["casual"]
     tpo_summary_text = ""
 
     if tpo_mode.startswith("캘린더"):
-        st.caption("외부 패키지 없이: ① ICS 업로드 또는 ② iCal(ICS) 공개 URL")
+        st.caption("외부 패키지 없이: ICS 업로드 또는 iCal(ICS) 공개 URL")
         ics_file = st.file_uploader("ICS 업로드(.ics)", type=["ics"])
-        ics_url = st.text_input("iCal(ICS) 공개 URL", value="", placeholder="https://.../calendar.ics")
+        ics_url = st.text_input("iCal(ICS) URL", value="", placeholder="https://.../calendar.ics")
 
         events: List[EventTPO] = []
         if ics_file is not None:
@@ -723,23 +647,21 @@ with st.sidebar:
             if ok:
                 events = parse_ics_minimal(b, target_date)
             else:
-                st.warning("ICS URL을 가져오지 못했습니다. 공개 URL인지 확인하세요.")
+                st.warning("ICS URL을 불러오지 못했습니다(공개 URL인지 확인).")
 
-        chosen_event = events[0] if events else None
-        if chosen_event:
-            tpo_tags = chosen_event.tags
-            tpo_summary_text = chosen_event.title
-            st.success(f"자동 반영: {chosen_event.title}")
-            st.write(f"TPO: {', '.join(tpo_tags)}")
+        if events:
+            chosen = events[0]
+            tpo_tags = chosen.tags
+            tpo_summary_text = chosen.title
+            st.success(f"자동 반영: {chosen.title}")
+            st.write("TPO:", ", ".join(tpo_tags))
         else:
-            st.info("해당 날짜 일정이 감지되지 않아 기본 TPO(casual)로 진행합니다.")
+            st.info("해당 날짜 일정이 없어서 기본(casual)로 진행합니다.")
             tpo_tags = ["casual"]
             tpo_summary_text = ""
-
     else:
-        st.caption("앱에서 오늘 일정(여러 개) 추가 → 자동으로 TPO 추론")
         with st.form("add_manual_event", clear_on_submit=True):
-            title = st.text_input("일정 제목", placeholder="예: 저녁 데이트 / 팀 발표 / 헬스장")
+            title = st.text_input("일정 제목", placeholder="예: 데이트 / 팀 발표 / 헬스장")
             time = st.text_input("시간(선택)", placeholder="예: 19:00")
             ok = st.form_submit_button("일정 추가")
             if ok:
@@ -750,47 +672,46 @@ with st.sidebar:
                     st.warning("일정 제목을 입력해주세요.")
 
         if st.session_state.manual_events:
-            st.write("등록된 일정(오늘):")
             for i, ev in enumerate(st.session_state.manual_events):
-                cols = st.columns([3.2, 1.2])
+                cols = st.columns([3.1, 1.0])
                 with cols[0]:
                     st.write(f"- {ev['title']}" + (f" ({ev['time']})" if ev["time"] else ""))
                 with cols[1]:
-                    if st.button("삭제", key=f"rm_ev_{i}"):
+                    if st.button("삭제", key=f"del_ev_{i}"):
                         st.session_state.manual_events.pop(i)
                         st.rerun()
 
             combined = " ".join([ev["title"] for ev in st.session_state.manual_events])
             tpo_tags = infer_tpo_tags(combined)
             tpo_summary_text = combined[:80] + ("…" if len(combined) > 80 else "")
-            st.success(f"TPO 자동 반영: {', '.join(tpo_tags)}")
+            st.success("TPO 자동 반영: " + ", ".join(tpo_tags))
         else:
-            st.info("일정이 없으면 기본 TPO(casual)로 진행합니다.")
+            st.info("일정이 없으면 기본(casual)입니다.")
             tpo_tags = ["casual"]
             tpo_summary_text = ""
 
     st.divider()
     st.subheader("🌦️ 날씨")
     city = st.text_input("도시", value=get_default_city())
-    api_key = get_openweather_key().strip()
-    auto_available = bool(api_key)
+    ow_key = get_openweather_key().strip()
+    auto_available = bool(ow_key)
 
     if auto_available:
         weather_mode = st.radio("날씨 모드", ["자동(OpenWeather)", "수동"], index=0)
     else:
-        st.info("OPENWEATHER_API_KEY가 없어 수동 날씨 입력만 가능합니다.")
         weather_mode = "수동"
+        st.info("OPENWEATHER_API_KEY가 없어 수동 입력만 가능합니다.")
 
     m_temp = st.slider("기온(℃)", -20, 45, 16)
     m_feels = st.slider("체감(℃)", -20, 45, 15)
     m_hum = st.slider("습도(%)", 0, 100, 50)
     m_wind = st.slider("바람(m/s)", 0.0, 20.0, 1.5, step=0.1)
     m_rain = st.selectbox("강수", ["없음", "비/눈 가능"], index=0)
-    m_desc = st.text_input("날씨 설명(선택)", value="맑음")
+    m_desc = st.text_input("날씨 설명", value="맑음")
 
     weather_err = None
     if weather_mode.startswith("자동"):
-        ok, payload = fetch_openweather(city, api_key)
+        ok, payload = fetch_openweather(city, ow_key)
         if ok:
             weather = payload["weather"]
         else:
@@ -807,51 +728,68 @@ with st.sidebar:
             rain=(m_rain != "없음"),
             desc=(m_desc.strip() or "정보 없음"),
         )
+
     if weather_err:
         st.warning(weather_err)
 
     st.divider()
-    st.subheader("🚫 확실히 피하기(옵션)")
-    banned_text = st.text_input(
-        "피하고 싶은 키워드(쉼표)",
-        value=",".join(st.session_state.prefs.get("banned_keywords", [])),
-        help="여긴 ‘강제 필터’ 느낌. 무드 기록/채팅에 ‘OO 빼줘’라고 써도 자동으로 반영돼요.",
-    )
-    banned_keywords_manual = [x.strip() for x in banned_text.split(",") if x.strip()]
-
-    st.divider()
-    st.subheader("🎲 다양성(반복 방지)")
-    st.session_state.prefs["diversity_strength"] = st.slider(
-        "다양성 강도", 0.0, 3.0, float(st.session_state.prefs.get("diversity_strength", 1.5)), 0.1
-    )
-    if st.button("추천 히스토리 초기화"):
-        st.session_state.prefs["recent_picks"] = {"tops": [], "bottoms": [], "outer": [], "shoes": []}
-        st.success("초기화 완료")
+    # ✅ "반영 보장" 버튼
+    if st.button("🔄 지금 코디 새로 뽑기(무조건 바뀜)"):
+        last = st.session_state.get("last_outfit", {})
+        ban = []
+        for k in ["top", "bottom", "outer", "shoes"]:
+            it = last.get(k)
+            if isinstance(it, dict) and it.get("name"):
+                ban.append(it["name"])
+        st.session_state.temp_ban_items = ban
+        st.rerun()
 
 
-# ✅ 매 실행마다: (사이드바 무드 기록 + 채팅 기록) 기반으로 style_dna/신호/금지어를 재구성
-st.session_state.prefs = rebuild_style_profile_from_records(
+# ---------------------
+# Rebuild profile every run (삭제/추가 즉시 반영)
+# ---------------------
+st.session_state.prefs = rebuild_profile(
     st.session_state.prefs,
     st.session_state.mood_records,
     st.session_state.messages,
-    banned_keywords_manual,
+    banned_manual,
 )
 
 
-# =========================
-# Page: Today (채팅 입력 -> rerun -> 상단 추천 갱신)
-# =========================
+# =========================================================
+# Pages
+# =========================================================
 if st.session_state.page == "오늘 추천":
-    pending_text = st.chat_input("채팅으로도 무드를 말해줘! (예: ‘미니멀한데 귀엽게’, ‘블랙은 빼줘’)")
+    # 채팅 입력
+    user_text = st.chat_input("수정사항을 자유롭게 써줘! (예: ‘좀 더 단정하게’, ‘블랙은 빼줘’, ‘다르게 해줘’)")
 
-    if pending_text:
-        st.session_state.messages.append({"role": "user", "content": pending_text})
-        st.session_state.messages.append({"role": "assistant", "content": "반영했어! 위 추천이 다시 계산될 거야."})
+    if user_text:
+        # ✅ "다르게/바꿔/새로" 요청이면 직전 코디를 강제 제외(반영 보장)
+        if any(k in user_text.lower() for k in REASK_TRIGGERS):
+            last = st.session_state.get("last_outfit", {})
+            ban = []
+            for part in ["top", "bottom", "outer", "shoes"]:
+                it = last.get(part)
+                if isinstance(it, dict) and it.get("name"):
+                    ban.append(it["name"])
+            st.session_state.temp_ban_items = ban
+
+        st.session_state.messages.append({"role": "user", "content": user_text})
+        st.session_state.messages.append({"role": "assistant", "content": "반영했어! 위 코디를 다시 계산할게."})
         st.rerun()
 
-    # 추천 계산
+    # 코디 계산
     outfit, reasons, color_plan = build_outfit(st.session_state.wardrobe, weather, tpo_tags, st.session_state.prefs)
-    st.session_state.prefs = update_pick_history(st.session_state.prefs, outfit)
+
+    # last_outfit 저장 (다시뽑기/바꿔줘에 사용)
+    st.session_state.last_outfit = {
+        "top": outfit.get("top"),
+        "bottom": outfit.get("bottom"),
+        "outer": outfit.get("outer"),
+        "shoes": outfit.get("shoes"),
+    }
+    # ✅ temp ban은 1회 추천 후 자동 해제(다음부터는 정상 추천)
+    st.session_state.temp_ban_items = []
 
     st.subheader("오늘의 추천 코디")
     st.write(
@@ -860,9 +798,9 @@ if st.session_state.page == "오늘 추천":
     )
     if tpo_summary_text:
         st.write(f"**일정 요약:** {tpo_summary_text}")
-    st.write(f"**TPO 자동 반영:** {', '.join(tpo_tags)}")
+    st.write(f"**TPO:** {', '.join(tpo_tags)}")
 
-    st.markdown("### 🎨 오늘 추천 컬러")
+    st.markdown("### 🎨 추천 컬러")
     st.write(
         f"- 베이스: **{pretty_color_name(color_plan['base'])}**\n"
         f"- 포인트: **{pretty_color_name(color_plan['accent'])}**\n"
@@ -886,28 +824,25 @@ if st.session_state.page == "오늘 추천":
 
     if outfit["extras"]:
         st.markdown("### 🎒 추가 아이템")
-        st.write(", ".join([x["name"] for x in outfit["extras"]]))
+        st.write(", ".join(outfit["extras"]))
 
     st.divider()
-    st.subheader("왜 이렇게 추천했나요?")
+    st.subheader("추천 이유")
     for r in reasons:
         st.write(f"- {r}")
 
     st.divider()
-    st.subheader("💬 채팅 기록")
+    st.subheader("💬 채팅")
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    with st.expander("현재 반영된 무드(무드 기록 + 채팅 합본)"):
-        st.write(st.session_state.prefs.get("style_dna", "") or "아직 없음")
-        st.write("추출 신호:", st.session_state.prefs.get("signals", {}))
+    with st.expander("현재 반영된 무드/선호(무드 기록 + 채팅 합본)"):
+        st.write(st.session_state.prefs.get("style_dna", "") or "없음")
+        st.write("signals:", st.session_state.prefs.get("signals", {}))
         st.write("금지 키워드:", st.session_state.prefs.get("banned_keywords", []))
 
 
-# =========================
-# Page: Wardrobe management
-# =========================
 elif st.session_state.page == "옷장 관리":
     st.subheader("옷장 관리")
     st.caption("내 옷을 등록/삭제하고 JSON으로 백업/복원할 수 있어요.")
@@ -920,7 +855,7 @@ elif st.session_state.page == "옷장 관리":
         name = st.text_input("이름", placeholder="예: 그레이 후드티")
         tags_text = st.text_input("태그(쉼표)", placeholder="예: casual,street,cozy,clean,minimal,black")
         warmth = st.slider("보온도(warmth) (의류만)", 0.0, 7.0, 3.0, step=0.5)
-        rain_ok = st.checkbox("비/눈 OK (아우터/신발에 권장)", value=False)
+        rain_ok = st.checkbox("비/눈 OK (아우터/신발 권장)", value=False)
         submitted = st.form_submit_button("추가")
 
         if submitted:
@@ -986,29 +921,23 @@ elif st.session_state.page == "옷장 관리":
         st.rerun()
 
 
-# =========================
-# Page: Shopping recommendations (+ mood input)
-# =========================
 elif st.session_state.page == "구매 추천":
     st.subheader("사면 좋은(없는) 옷 추천")
-    st.caption("내 옷장 + 오늘 날씨 + TPO + (무드 기록/채팅)을 보고 ‘없으면’ 도움 되는 아이템을 추천해요.")
+    st.caption("현재 옷장 + 날씨 + TPO + 무드 기록/채팅을 보고 추천해요.")
 
     st.markdown("### ✍️ 구매 추천용 무드 추가(선택)")
-    st.caption("※ 이 입력은 사이드바 ‘무드 기록’에 저장되며, 삭제도 가능합니다.")
+    st.caption("여기서 추가하면 사이드바 ‘무드 기록’에 저장되고 삭제도 가능해요.")
     with st.form("add_mood_from_buy", clear_on_submit=True):
-        mood_extra = st.text_input("무드 한 줄 추가", placeholder="예: 모노톤인데 따뜻한 느낌 / 빈티지 but 깔끔")
+        mood_extra = st.text_input("무드 한 줄 추가", placeholder="예: 차분한데 포인트 있는 느낌 / 단정하지만 편하게")
         ok = st.form_submit_button("무드 기록에 추가")
         if ok:
             if mood_extra.strip():
-                st.session_state.mood_records.append({
-                    "text": mood_extra.strip(),
-                    "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
+                st.session_state.mood_records.append({"text": mood_extra.strip(), "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
                 st.rerun()
             else:
                 st.info("입력한 내용이 없어요.")
 
-    missing = suggest_missing_items(st.session_state.wardrobe, weather, tpo_tags, st.session_state.prefs)
+    recs = suggest_missing_items(st.session_state.wardrobe, weather, tpo_tags, st.session_state.prefs)
 
     st.write(
         f"기준: **체감 {weather.feels_c:.1f}℃({temp_band(weather.feels_c)})**, "
@@ -1016,27 +945,23 @@ elif st.session_state.page == "구매 추천":
         f"**TPO {', '.join(tpo_tags)}**"
     )
 
-    if not missing:
-        st.success("현재 조건 기준으로 강력 추천할 ‘누락 아이템’이 크게 보이지 않아요! 👍")
-    else:
-        for r in missing:
-            with st.container(border=True):
-                st.markdown(f"### 🛍️ {r['name']}")
-                st.write(f"- 추천 이유: {r['why']}")
+    for r in recs:
+        with st.container(border=True):
+            st.markdown(f"### 🛍️ {r['name']}")
+            st.write(f"- 추천 이유: {r['why']}")
 
-    st.divider()
-    st.subheader("현재 반영된 무드(무드 기록 + 채팅 합본)")
-    st.write(st.session_state.prefs.get("style_dna", "") or "아직 없음")
-    st.write("추출 신호:", st.session_state.prefs.get("signals", {}))
-    st.write("금지 키워드:", st.session_state.prefs.get("banned_keywords", []))
+    with st.expander("현재 반영된 무드/선호(합본)"):
+        st.write(st.session_state.prefs.get("style_dna", "") or "없음")
+        st.write("signals:", st.session_state.prefs.get("signals", {}))
+        st.write("금지 키워드:", st.session_state.prefs.get("banned_keywords", []))
 
 
 with st.expander("🔎 디버그"):
-    st.write("page:", st.session_state.page)
     st.write("openai_key_present:", bool(get_openai_key()))
+    st.write("temp_ban_items:", st.session_state.temp_ban_items)
+    st.write("last_outfit:", st.session_state.last_outfit)
     st.write("mood_records:", st.session_state.mood_records)
     st.write("messages:", st.session_state.messages)
     st.write("prefs:", st.session_state.prefs)
     st.write("tpo_tags:", tpo_tags)
-    st.write("wardrobe:", st.session_state.wardrobe)
     st.write("manual_events:", st.session_state.manual_events)
